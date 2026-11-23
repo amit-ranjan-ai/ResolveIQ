@@ -4,6 +4,7 @@ from app.models.organisation_membership import OrganisationMembership
 from app.models.team import Team
 from app.models.team_membership import TeamMembership
 from app.models.ticket import Ticket
+from app.models.ticket_comment import TicketComment
 from app.models.user import User
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     "Team",
     "TeamMembership",
     "Ticket",
+    "TicketComment",
     "User",
 ]

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import jwt
 from jwt.exceptions import InvalidTokenError
@@ -9,7 +9,7 @@ from app.core.config import settings
 def create_access_token(user_id: str) -> str:
     """Create a signed JWT access token."""
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     expires_at = now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
 

@@ -26,6 +26,11 @@ class Ticket(Base):
             "ticket_number",
             name="uq_tickets_organisation_ticket_number",
         ),
+        UniqueConstraint(
+            "organisation_id",
+            "id",
+            name="uq_tickets_organisation_id",
+        ),
         CheckConstraint(
             "status IN ('Open', 'Assigned', 'In Progress', "
             "'Pending', 'Resolved', 'Closed', 'Reopened')",

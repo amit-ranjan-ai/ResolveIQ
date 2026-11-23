@@ -953,3 +953,205 @@ def test_assignment_rejects_empty_payload(
     )
 
     assert response.status_code == 400
+
+
+def test_owner_can_create_and_view_ticket_comments(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    public_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "We are investigating this issue.",
+            "is_internal": False,
+        },
+    )
+
+    assert public_response.status_code == 201
+    assert public_response.json()["message"] == ("We are investigating this issue.")
+    assert public_response.json()["is_internal"] is False
+
+    internal_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Internal investigation note.",
+            "is_internal": True,
+        },
+    )
+
+    assert internal_response.status_code == 201
+    assert internal_response.json()["is_internal"] is True
+
+    list_response = client.get(f"/api/v1/tickets/{ticket_id}/comments")
+
+    assert list_response.status_code == 200
+    assert len(list_response.json()) == 2
+    assert list_response.json()[0]["message"] == ("We are investigating this issue.")
+
+
+def test_requester_can_only_view_public_ticket_comments(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+        role="REQUESTER",
+    )
+
+    created = create_ticket(client, context)
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    public_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "I am still experiencing this issue.",
+            "is_internal": False,
+        },
+    )
+
+    assert public_response.status_code == 201
+
+    internal_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "This should not be allowed.",
+            "is_internal": True,
+        },
+    )
+
+    assert internal_response.status_code == 403
+
+    list_response = client.get(f"/api/v1/tickets/{ticket_id}/comments")
+
+    assert list_response.status_code == 200
+    assert len(list_response.json()) == 1
+    assert list_response.json()[0]["message"] == ("I am still experiencing this issue.")
+    assert list_response.json()[0]["is_internal"] is False
+
+
+def test_agent_can_comment_on_assigned_ticket(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    with db_session_factory() as db:
+        agent_user, agent_membership = create_member(
+            db,
+            uuid.UUID(context["organisation_id"]),
+            "AGENT",
+        )
+
+        ticket = db.get(Ticket, uuid.UUID(ticket_id))
+        ticket.assigned_agent_membership_id = agent_membership.id
+
+        db.commit()
+
+        agent_token = create_access_token(str(agent_user.id))
+
+    client.headers.update({"Authorization": f"Bearer {agent_token}"})
+
+    create_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "I am investigating this ticket.",
+            "is_internal": False,
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    internal_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Internal technical investigation.",
+            "is_internal": True,
+        },
+    )
+
+    assert internal_response.status_code == 201
+
+    list_response = client.get(f"/api/v1/tickets/{ticket_id}/comments")
+
+    assert list_response.status_code == 200
+    assert len(list_response.json()) == 2
+
+
+def test_agent_cannot_comment_on_unassigned_ticket(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    with db_session_factory() as db:
+        agent_user, _agent_membership = create_member(
+            db,
+            uuid.UUID(context["organisation_id"]),
+            "AGENT",
+        )
+
+        db.commit()
+
+        agent_token = create_access_token(str(agent_user.id))
+
+    client.headers.update({"Authorization": f"Bearer {agent_token}"})
+
+    response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Unauthorized comment.",
+            "is_internal": False,
+        },
+    )
+
+    assert response.status_code == 404
+
+    list_response = client.get(f"/api/v1/tickets/{ticket_id}/comments")
+
+    assert list_response.status_code == 404
+
+
+def test_ticket_comments_require_authentication(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    client.headers.pop("Authorization", None)
+
+    create_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Unauthenticated comment.",
+            "is_internal": False,
+        },
+    )
+
+    list_response = client.get(f"/api/v1/tickets/{ticket_id}/comments")
+
+    assert create_response.status_code == 401
+    assert list_response.status_code == 401
