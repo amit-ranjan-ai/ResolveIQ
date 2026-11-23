@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import app.models
+from app.core.config import settings
 from app.core.jwt import create_access_token
 from app.db.base import Base
 from app.db.dependencies import get_db
@@ -1155,3 +1156,306 @@ def test_ticket_comments_require_authentication(
 
     assert create_response.status_code == 401
     assert list_response.status_code == 401
+
+
+def test_upload_list_and_download_ticket_attachment(
+    client,
+    db_session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "UPLOAD_DIRECTORY", tmp_path)
+
+    context = create_ticket_context(db_session_factory, role="OWNER")
+    ticket_response = create_ticket(client, context)
+    assert ticket_response.status_code == 201
+    ticket_id = ticket_response.json()["id"]
+
+    file_content = b"ResolveIQ attachment test"
+
+    upload_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/attachments",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        files={
+            "file": (
+                "evidence.txt",
+                file_content,
+                "text/plain",
+            )
+        },
+    )
+    assert upload_response.status_code == 201
+
+    attachment = upload_response.json()
+
+    assert attachment["original_filename"] == "evidence.txt"
+    assert attachment["file_size"] == len(file_content)
+    assert "storage_path" not in attachment
+    assert "stored_filename" not in attachment
+
+    attachment_id = attachment["id"]
+
+    list_response = client.get(
+        f"/api/v1/tickets/{ticket_id}/attachments",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+    )
+
+    assert list_response.status_code == 200
+    assert len(list_response.json()) == 1
+    assert list_response.json()[0]["id"] == attachment_id
+
+    download_response = client.get(
+        f"/api/v1/attachments/{attachment_id}/download",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+    )
+
+    assert download_response.status_code == 200
+    assert download_response.content == file_content
+
+
+def test_upload_rejects_invalid_file_type(
+    client,
+    db_session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "UPLOAD_DIRECTORY", tmp_path)
+
+    context = create_ticket_context(db_session_factory, role="OWNER")
+    ticket_response = create_ticket(client, context)
+    ticket_id = ticket_response.json()["id"]
+
+    response = client.post(
+        f"/api/v1/tickets/{ticket_id}/attachments",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        files={
+            "file": (
+                "malicious.exe",
+                b"Invalid executable content",
+                "application/octet-stream",
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "File type is not allowed."
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_upload_rejects_oversized_file(
+    client,
+    db_session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "UPLOAD_DIRECTORY", tmp_path)
+    monkeypatch.setattr(settings, "MAX_UPLOAD_SIZE", 8)
+
+    context = create_ticket_context(db_session_factory, role="OWNER")
+    ticket_response = create_ticket(client, context)
+    ticket_id = ticket_response.json()["id"]
+
+    response = client.post(
+        f"/api/v1/tickets/{ticket_id}/attachments",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        files={
+            "file": (
+                "large.txt",
+                b"123456789",
+                "text/plain",
+            )
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "File size cannot exceed 10 MB."
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_ticket_attachments_require_authentication(
+    client,
+    db_session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "UPLOAD_DIRECTORY", tmp_path)
+
+    context = create_ticket_context(db_session_factory, role="OWNER")
+    ticket_response = create_ticket(client, context)
+    ticket_id = ticket_response.json()["id"]
+
+    upload_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/attachments",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        files={
+            "file": (
+                "evidence.txt",
+                b"Authentication test",
+                "text/plain",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    attachment_id = upload_response.json()["id"]
+    client.headers.pop("Authorization", None)
+
+    upload_unauthenticated = client.post(
+        f"/api/v1/tickets/{ticket_id}/attachments",
+        files={"file": ("test.txt", b"test", "text/plain")},
+    )
+
+    list_unauthenticated = client.get(f"/api/v1/tickets/{ticket_id}/attachments")
+
+    download_unauthenticated = client.get(
+        f"/api/v1/attachments/{attachment_id}/download"
+    )
+
+    assert upload_unauthenticated.status_code == 401
+    assert list_unauthenticated.status_code == 401
+    assert download_unauthenticated.status_code == 401
+
+
+def test_requester_cannot_access_another_requesters_attachments(
+    client,
+    db_session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "UPLOAD_DIRECTORY", tmp_path)
+
+    context = create_ticket_context(
+        db_session_factory,
+        role="REQUESTER",
+    )
+
+    ticket_response = create_ticket(client, context)
+    assert ticket_response.status_code == 201
+
+    ticket_id = ticket_response.json()["id"]
+
+    upload_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/attachments",
+        files={
+            "file": (
+                "private.txt",
+                b"Private requester attachment",
+                "text/plain",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    attachment_id = upload_response.json()["id"]
+
+    with db_session_factory() as db:
+        another_user, _another_membership = create_member(
+            db,
+            uuid.UUID(context["organisation_id"]),
+            "REQUESTER",
+        )
+        db.commit()
+
+        another_token = create_access_token(str(another_user.id))
+
+    client.headers.update({"Authorization": f"Bearer {another_token}"})
+
+    list_response = client.get(f"/api/v1/tickets/{ticket_id}/attachments")
+
+    download_response = client.get(f"/api/v1/attachments/{attachment_id}/download")
+
+    assert list_response.status_code == 404
+    assert download_response.status_code == 404
+
+
+def test_agent_cannot_access_unrelated_ticket_attachments(
+    client,
+    db_session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "UPLOAD_DIRECTORY", tmp_path)
+
+    context = create_ticket_context(db_session_factory, role="OWNER")
+    ticket_response = create_ticket(client, context)
+
+    assert ticket_response.status_code == 201
+    ticket_id = ticket_response.json()["id"]
+
+    upload_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/attachments",
+        files={
+            "file": (
+                "restricted.txt",
+                b"Restricted attachment",
+                "text/plain",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+    attachment_id = upload_response.json()["id"]
+
+    with db_session_factory() as db:
+        agent_user, _agent_membership = create_member(
+            db,
+            uuid.UUID(context["organisation_id"]),
+            "AGENT",
+        )
+        db.commit()
+
+        agent_token = create_access_token(str(agent_user.id))
+
+    client.headers.update({"Authorization": f"Bearer {agent_token}"})
+
+    list_response = client.get(f"/api/v1/tickets/{ticket_id}/attachments")
+
+    download_response = client.get(f"/api/v1/attachments/{attachment_id}/download")
+
+    assert list_response.status_code == 404
+    assert download_response.status_code == 404
+
+
+@pytest.mark.parametrize("role", ["OWNER", "ADMIN"])
+def test_owner_and_admin_can_access_ticket_attachments(
+    client,
+    db_session_factory,
+    monkeypatch,
+    tmp_path,
+    role,
+):
+    monkeypatch.setattr(settings, "UPLOAD_DIRECTORY", tmp_path)
+
+    context = create_ticket_context(db_session_factory, role=role)
+    ticket_response = create_ticket(client, context)
+
+    assert ticket_response.status_code == 201
+    ticket_id = ticket_response.json()["id"]
+
+    file_content = b"Organisation attachment access test"
+
+    upload_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/attachments",
+        files={
+            "file": (
+                "organisation-file.txt",
+                file_content,
+                "text/plain",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+    attachment_id = upload_response.json()["id"]
+
+    list_response = client.get(f"/api/v1/tickets/{ticket_id}/attachments")
+
+    download_response = client.get(f"/api/v1/attachments/{attachment_id}/download")
+
+    assert list_response.status_code == 200
+    assert len(list_response.json()) == 1
+
+    assert download_response.status_code == 200
+    assert download_response.content == file_content
