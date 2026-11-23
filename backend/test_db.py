@@ -1,20 +1,16 @@
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.session import engine
 
-
 try:
     with engine.connect() as connection:
-        result = connection.execute(text("SELECT current_database(), current_user"))
-        database, user = result.fetchone()
+        result = connection.execute(text("SELECT current_user"))
+        user = result.scalar()
 
         print("Database connection successful!")
-        print("Database:", database)
         print("Connected user:", user)
 
-except Exception as error:
+except SQLAlchemyError as error:
     print("Database connection failed!")
     print("Error:", error)
-
-finally:
-    engine.dispose()

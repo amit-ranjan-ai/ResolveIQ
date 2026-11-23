@@ -1,22 +1,27 @@
 from logging.config import fileConfig
 
 from alembic import context
+from sqlalchemy import create_engine, pool
+from sqlalchemy.engine import URL
 
-from app.db.session import engine
+import app.models  # noqa: F401
+from app.core.config import settings
+from app.db.base import Base
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Database models will be connected here when we create them.
-target_metadata = None
+target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    """Run migrations without creating a database connection."""
-
-    url = engine.url.render_as_string(hide_password=False)
+    url = (
+        f"postgresql+psycopg://{settings.DB_USER}:"
+        f"{settings.DB_PASSWORD}@{settings.DB_HOST}:"
+        f"{settings.DB_PORT}/{settings.DB_NAME}"
+    )
 
     context.configure(
         url=url,
@@ -31,9 +36,21 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations using the application database connection."""
+    database_url = URL.create(
+        drivername="postgresql+psycopg",
+        username=settings.DB_USER,
+        password=settings.DB_PASSWORD,
+        host=settings.DB_HOST,
+        port=settings.DB_PORT,
+        database=settings.DB_NAME,
+    )
 
-    with engine.connect() as connection:
+    connectable = create_engine(
+        database_url,
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
@@ -42,6 +59,8 @@ def run_migrations_online() -> None:
 
         with context.begin_transaction():
             context.run_migrations()
+
+    connectable.dispose()
 
 
 if context.is_offline_mode():
