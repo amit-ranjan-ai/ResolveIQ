@@ -26,6 +26,7 @@ from app.services.file_storage import (
     delete_stored_file,
     save_upload_file,
 )
+from app.services.ticket_activity import record_ticket_activity
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,21 @@ async def upload_ticket_attachment(
         )
 
         db.add(attachment)
+
+        record_ticket_activity(
+            db=db,
+            organisation_id=ticket.organisation_id,
+            ticket_id=ticket.id,
+            actor_membership_id=membership.id,
+            activity_type="ATTACHMENT_UPLOADED",
+            description="An attachment was uploaded.",
+            extra_data={
+                "filename": attachment.original_filename,
+                "file_size": attachment.file_size,
+                "content_type": attachment.content_type,
+            },
+        )
+
         db.commit()
         db.refresh(attachment)
 

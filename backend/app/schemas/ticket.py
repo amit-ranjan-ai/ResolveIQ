@@ -25,6 +25,18 @@ class TicketCreate(BaseModel):
 class TicketUpdate(BaseModel):
     subject: str | None = Field(default=None, min_length=3, max_length=200)
     description: str | None = Field(default=None, min_length=5)
+    status: (
+        Literal[
+            "Open",
+            "Assigned",
+            "In Progress",
+            "Pending",
+            "Resolved",
+            "Closed",
+            "Reopened",
+        ]
+        | None
+    ) = None
 
     category_id: UUID | None = None
     assigned_team_id: UUID | None = None
@@ -38,6 +50,7 @@ class TicketUpdate(BaseModel):
         "description",
         "impact",
         "urgency",
+        "status",
         mode="before",
     )
     @classmethod

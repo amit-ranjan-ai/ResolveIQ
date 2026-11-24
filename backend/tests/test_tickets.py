@@ -2,7 +2,7 @@ import uuid
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -17,6 +17,7 @@ from app.models.organisation_membership import OrganisationMembership
 from app.models.team import Team
 from app.models.team_membership import TeamMembership
 from app.models.ticket import Ticket
+from app.models.ticket_activity import TicketActivity
 from app.models.user import User
 
 
@@ -123,6 +124,7 @@ def create_ticket_context(
             "caller_user_id": str(caller.id),
             "caller_membership_id": str(caller_membership.id),
             "requester_membership_id": str(requester_membership.id),
+            "requester_user_id": str(requester_membership.user_id),
             "access_token": access_token,
         }
 
@@ -1459,3 +1461,578 @@ def test_owner_and_admin_can_access_ticket_attachments(
 
     assert download_response.status_code == 200
     assert download_response.content == file_content
+
+
+def test_ticket_creation_records_activity(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+        role="OWNER",
+    )
+
+    response = create_ticket(client, context)
+
+    assert response.status_code == 201
+
+    ticket_data = response.json()
+    ticket_id = uuid.UUID(ticket_data["id"])
+
+    with db_session_factory() as db:
+        activities = db.scalars(
+            select(TicketActivity).where(
+                TicketActivity.ticket_id == ticket_id,
+            )
+        ).all()
+
+        assert len(activities) == 1
+
+        activity = activities[0]
+
+        assert activity.activity_type == "TICKET_CREATED"
+        assert activity.organisation_id == uuid.UUID(context["organisation_id"])
+        assert activity.actor_membership_id == uuid.UUID(
+            context["caller_membership_id"]
+        )
+        assert activity.description == (
+            f"Ticket {ticket_data['ticket_number']} was created."
+        )
+        assert activity.extra_data["ticket_number"] == (ticket_data["ticket_number"])
+
+
+def test_get_ticket_activities(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+        role="OWNER",
+    )
+
+    ticket_response = create_ticket(client, context)
+
+    assert ticket_response.status_code == 201
+
+    ticket_id = ticket_response.json()["id"]
+
+    response = client.get(
+        f"/api/v1/tickets/{ticket_id}/activities",
+    )
+
+    assert response.status_code == 200
+
+    activities = response.json()
+
+    assert len(activities) == 1
+    assert activities[0]["activity_type"] == "TICKET_CREATED"
+    assert activities[0]["description"] == (
+        f"Ticket {ticket_response.json()['ticket_number']} was created."
+    )
+
+
+def test_requester_can_view_own_ticket_activities(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+        role="REQUESTER",
+    )
+
+    ticket_response = create_ticket(client, context)
+
+    assert ticket_response.status_code == 201
+
+    ticket_id = ticket_response.json()["id"]
+
+    response = client.get(
+        f"/api/v1/tickets/{ticket_id}/activities",
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    assert response.json()[0]["activity_type"] == "TICKET_CREATED"
+
+
+def test_unauthenticated_user_cannot_view_ticket_activities(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+    )
+
+    ticket_response = create_ticket(client, context)
+
+    assert ticket_response.status_code == 201
+
+    client.headers.clear()
+
+    response = client.get(
+        f"/api/v1/tickets/{ticket_response.json()['id']}/activities",
+    )
+
+    assert response.status_code == 401
+
+
+def test_public_comment_records_ticket_activity(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+        role="OWNER",
+    )
+
+    ticket_response = create_ticket(client, context)
+    assert ticket_response.status_code == 201
+
+    ticket_id = ticket_response.json()["id"]
+
+    comment_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Testing public comment activity.",
+            "is_internal": False,
+        },
+    )
+
+    assert comment_response.status_code == 201
+
+    response = client.get(
+        f"/api/v1/tickets/{ticket_id}/activities",
+    )
+
+    assert response.status_code == 200
+
+    activity_types = [activity["activity_type"] for activity in response.json()]
+
+    assert "TICKET_CREATED" in activity_types
+    assert "COMMENT_ADDED" in activity_types
+
+
+def test_internal_note_records_ticket_activity(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+        role="OWNER",
+    )
+
+    ticket_response = create_ticket(client, context)
+    assert ticket_response.status_code == 201
+
+    ticket_id = ticket_response.json()["id"]
+
+    comment_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Testing internal note activity.",
+            "is_internal": True,
+        },
+    )
+
+    assert comment_response.status_code == 201
+
+    response = client.get(
+        f"/api/v1/tickets/{ticket_id}/activities",
+    )
+
+    assert response.status_code == 200
+
+    activity_types = [activity["activity_type"] for activity in response.json()]
+
+    assert "INTERNAL_NOTE_ADDED" in activity_types
+
+
+def test_requester_cannot_view_internal_note_activity(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+        role="OWNER",
+    )
+
+    ticket_response = create_ticket(client, context)
+    assert ticket_response.status_code == 201
+
+    ticket_id = ticket_response.json()["id"]
+
+    internal_note_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Confidential internal note.",
+            "is_internal": True,
+        },
+    )
+
+    assert internal_note_response.status_code == 201
+
+    requester_context = create_ticket_context(
+        db_session_factory,
+        role="REQUESTER",
+    )
+
+    client.headers.update(
+        {"Authorization": (f"Bearer {requester_context['access_token']}")}
+    )
+
+    response = client.get(
+        f"/api/v1/tickets/{ticket_id}/activities",
+    )
+
+    assert response.status_code == 403
+
+
+def test_requester_can_view_public_but_not_internal_note_activities(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+        role="OWNER",
+    )
+
+    ticket_response = create_ticket(client, context)
+    assert ticket_response.status_code == 201
+
+    ticket_id = ticket_response.json()["id"]
+
+    # Create a public comment.
+    public_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Public update.",
+            "is_internal": False,
+        },
+    )
+    assert public_response.status_code == 201
+
+    # Create an internal note.
+    internal_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Confidential internal note.",
+            "is_internal": True,
+        },
+    )
+    assert internal_response.status_code == 201
+
+    # Authenticate as the actual ticket requester.
+    with db_session_factory() as db:
+        requester = db.get(
+            OrganisationMembership,
+            uuid.UUID(context["requester_membership_id"]),
+        )
+        requester_user_id = str(requester.user_id)
+
+    requester_token = create_access_token(requester_user_id)
+
+    client.headers.update({"Authorization": f"Bearer {requester_token}"})
+
+    response = client.get(
+        f"/api/v1/tickets/{ticket_id}/activities",
+    )
+
+    assert response.status_code == 200
+
+    activities = response.json()
+
+    activity_types = [activity["activity_type"] for activity in activities]
+
+    assert "TICKET_CREATED" in activity_types
+    assert "COMMENT_ADDED" in activity_types
+    assert "INTERNAL_NOTE_ADDED" not in activity_types
+
+    descriptions = [activity["description"] for activity in activities]
+
+    assert "Confidential internal note." not in descriptions
+
+
+def test_attachment_upload_records_ticket_activity(
+    client,
+    db_session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "UPLOAD_DIRECTORY", tmp_path)
+
+    context = create_ticket_context(db_session_factory, role="OWNER")
+    ticket_response = create_ticket(client, context)
+    assert ticket_response.status_code == 201
+
+    ticket_id = ticket_response.json()["id"]
+
+    upload_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/attachments",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        files={
+            "file": (
+                "evidence.txt",
+                b"ResolveIQ attachment test",
+                "text/plain",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    activity_response = client.get(
+        f"/api/v1/tickets/{ticket_id}/activities",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+    )
+
+    assert activity_response.status_code == 200
+
+    activities = activity_response.json()
+
+    attachment_activity = next(
+        (
+            activity
+            for activity in activities
+            if activity["activity_type"] == "ATTACHMENT_UPLOADED"
+        ),
+        None,
+    )
+
+    assert attachment_activity is not None
+    assert attachment_activity["description"] == "An attachment was uploaded."
+    assert attachment_activity["extra_data"]["filename"] == "evidence.txt"
+    assert attachment_activity["extra_data"]["file_size"] == len(
+        b"ResolveIQ attachment test"
+    )
+
+
+def test_priority_change_records_ticket_activity(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    response = client.patch(
+        f"/api/v1/tickets/{ticket_id}",
+        json={"impact": "LOW"},
+    )
+
+    assert response.status_code == 200
+
+    activity_response = client.get(
+        f"/api/v1/tickets/{ticket_id}/activities",
+    )
+
+    assert activity_response.status_code == 200
+
+    activities = activity_response.json()
+
+    priority_activity = next(
+        (
+            activity
+            for activity in activities
+            if activity["activity_type"] == "PRIORITY_CHANGED"
+        ),
+        None,
+    )
+
+    assert priority_activity is not None
+    assert priority_activity["old_value"] != priority_activity["new_value"]
+
+
+def test_assignment_change_records_ticket_activity(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory, role="OWNER")
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+    ticket_id = created.json()["id"]
+
+    with db_session_factory() as db:
+        organisation_id = uuid.UUID(context["organisation_id"])
+
+        _agent_user, agent_membership = create_member(
+            db,
+            organisation_id,
+            "AGENT",
+        )
+
+        team = Team(
+            organisation_id=organisation_id,
+            name="Activity Test Team",
+        )
+        db.add(team)
+        db.flush()
+
+        db.add(
+            TeamMembership(
+                organisation_id=organisation_id,
+                team_id=team.id,
+                organisation_membership_id=agent_membership.id,
+            )
+        )
+        db.commit()
+
+        team_id = str(team.id)
+        agent_membership_id = str(agent_membership.id)
+
+    response = client.patch(
+        f"/api/v1/tickets/{ticket_id}/assignment",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        json={
+            "assigned_team_id": team_id,
+            "assigned_agent_membership_id": agent_membership_id,
+        },
+    )
+
+    assert response.status_code == 200
+
+    activity_response = client.get(
+        f"/api/v1/tickets/{ticket_id}/activities",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+    )
+
+    assert activity_response.status_code == 200
+
+    activities = activity_response.json()
+
+    assignment_activity = next(
+        (
+            activity
+            for activity in activities
+            if activity["activity_type"] == "ASSIGNMENT_CHANGED"
+        ),
+        None,
+    )
+
+    assert assignment_activity is not None
+    assert assignment_activity["description"] == ("Ticket assignment was updated.")
+
+
+def test_status_change_records_ticket_activity(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    response = client.patch(
+        f"/api/v1/tickets/{ticket_id}",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        json={"status": "In Progress"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "In Progress"
+
+    activity_response = client.get(
+        f"/api/v1/tickets/{ticket_id}/activities",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+    )
+
+    assert activity_response.status_code == 200
+
+    activities = activity_response.json()
+
+    status_activity = next(
+        (
+            activity
+            for activity in activities
+            if activity["activity_type"] == "STATUS_CHANGED"
+        ),
+        None,
+    )
+
+    assert status_activity is not None
+    assert status_activity["old_value"] == "Open"
+    assert status_activity["new_value"] == "In Progress"
+
+
+def test_resolving_ticket_sets_resolved_at(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    response = client.patch(
+        f"/api/v1/tickets/{ticket_id}",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        json={"status": "Resolved"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "Resolved"
+    assert response.json()["resolved_at"] is not None
+    assert response.json()["closed_at"] is None
+
+
+def test_closing_ticket_sets_closed_at(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    response = client.patch(
+        f"/api/v1/tickets/{ticket_id}",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        json={"status": "Closed"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "Closed"
+    assert response.json()["closed_at"] is not None
+    assert response.json()["resolved_at"] is None
+
+
+def test_reopening_ticket_clears_resolution_timestamps(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+    headers = {"Authorization": f"Bearer {context['access_token']}"}
+
+    resolved_response = client.patch(
+        f"/api/v1/tickets/{ticket_id}",
+        headers=headers,
+        json={"status": "Resolved"},
+    )
+
+    assert resolved_response.status_code == 200
+    assert resolved_response.json()["resolved_at"] is not None
+
+    reopened_response = client.patch(
+        f"/api/v1/tickets/{ticket_id}",
+        headers=headers,
+        json={"status": "Reopened"},
+    )
+
+    assert reopened_response.status_code == 200
+    assert reopened_response.json()["status"] == "Reopened"
+    assert reopened_response.json()["resolved_at"] is None
+    assert reopened_response.json()["closed_at"] is None

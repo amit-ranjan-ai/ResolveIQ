@@ -14,6 +14,7 @@ from app.schemas.ticket_comment import (
     TicketCommentCreate,
     TicketCommentResponse,
 )
+from app.services.ticket_activity import record_ticket_activity
 
 router = APIRouter(tags=["Ticket Comments"])
 
@@ -52,6 +53,26 @@ def create_ticket_comment(
     )
 
     db.add(comment)
+
+    activity_type = (
+        "INTERNAL_NOTE_ADDED" if comment_data.is_internal else "COMMENT_ADDED"
+    )
+
+    description = (
+        "An internal note was added."
+        if comment_data.is_internal
+        else "A comment was added."
+    )
+
+    record_ticket_activity(
+        db=db,
+        organisation_id=ticket.organisation_id,
+        ticket_id=ticket.id,
+        actor_membership_id=membership.id,
+        activity_type=activity_type,
+        description=description,
+    )
+
     db.commit()
     db.refresh(comment)
 

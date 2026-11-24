@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -25,6 +26,7 @@ from app.schemas.ticket import (
     TicketResponse,
     TicketUpdate,
 )
+from app.services.ticket_activity import record_ticket_activity
 
 router = APIRouter(
     tags=["Tickets"],
@@ -271,11 +273,31 @@ def create_ticket(
 
     try:
         db.add(ticket)
+        db.flush()
+
+        record_ticket_activity(
+            db=db,
+            organisation_id=ticket.organisation_id,
+            ticket_id=ticket.id,
+            actor_membership_id=current_membership.id,
+            activity_type="TICKET_CREATED",
+            description=f"Ticket {ticket.ticket_number} was created.",
+            extra_data={
+                "ticket_number": ticket.ticket_number,
+                "subject": ticket.subject,
+            },
+        )
+
         db.commit()
         db.refresh(ticket)
 
     except IntegrityError as error:
         db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ticket could not be created because of a database conflict.",
+        ) from error
 
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -451,6 +473,9 @@ def update_ticket(
 
     get_active_organisation(ticket.organisation_id, db)
 
+    old_status = ticket.status
+    old_priority = ticket.priority
+
     updates = ticket_data.model_dump(exclude_unset=True)
 
     if not updates:
@@ -504,7 +529,42 @@ def update_ticket(
             ticket.urgency,
         )
 
+    if "status" in updates and ticket.status != old_status:
+        if ticket.status == "Resolved":
+            ticket.resolved_at = datetime.now(UTC)
+            ticket.closed_at = None
+
+        elif ticket.status == "Closed":
+            ticket.closed_at = datetime.now(UTC)
+
+        else:
+            ticket.resolved_at = None
+            ticket.closed_at = None
+
     try:
+        if ticket.status != old_status:
+            record_ticket_activity(
+                db=db,
+                organisation_id=ticket.organisation_id,
+                ticket_id=ticket.id,
+                actor_membership_id=current_membership.id,
+                activity_type="STATUS_CHANGED",
+                description=f"Ticket status changed from {old_status} to {ticket.status}.",
+                old_value=str(old_status),
+                new_value=str(ticket.status),
+            )
+
+        if ticket.priority != old_priority:
+            record_ticket_activity(
+                db=db,
+                organisation_id=ticket.organisation_id,
+                ticket_id=ticket.id,
+                actor_membership_id=current_membership.id,
+                activity_type="PRIORITY_CHANGED",
+                description=f"Ticket priority changed from {old_priority} to {ticket.priority}.",
+                old_value=str(old_priority),
+                new_value=str(ticket.priority),
+            )
         db.commit()
         db.refresh(ticket)
 
@@ -558,6 +618,8 @@ def update_ticket_assignment(
         )
 
     get_active_organisation(ticket.organisation_id, db)
+    old_team_id = ticket.assigned_team_id
+    old_agent_id = ticket.assigned_agent_membership_id
 
     updates = assignment_data.model_dump(exclude_unset=True)
 
@@ -588,6 +650,18 @@ def update_ticket_assignment(
         setattr(ticket, field, value)
 
     try:
+        if (
+            ticket.assigned_team_id != old_team_id
+            or ticket.assigned_agent_membership_id != old_agent_id
+        ):
+            record_ticket_activity(
+                db=db,
+                organisation_id=ticket.organisation_id,
+                ticket_id=ticket.id,
+                actor_membership_id=current_membership.id,
+                activity_type="ASSIGNMENT_CHANGED",
+                description="Ticket assignment was updated.",
+            )
         db.commit()
         db.refresh(ticket)
 
