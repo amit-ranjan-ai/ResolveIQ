@@ -2273,3 +2273,119 @@ def test_user_cannot_access_another_organisations_ticket_sla(
     response = client.get(f"/api/v1/tickets/{ticket_id}/sla")
 
     assert response.status_code == 403
+
+
+def test_owner_can_list_sla_policies(client, db_session_factory):
+    context = create_ticket_context(db_session_factory)
+
+    response = client.get(
+        f"/api/v1/organisations/{context['organisation_id']}/sla-policies",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()) == 4
+
+    priorities = [policy["priority"] for policy in response.json()]
+    assert priorities == ["P1", "P2", "P3", "P4"]
+
+
+def test_admin_can_update_sla_policy(client, db_session_factory):
+    context = create_ticket_context(db_session_factory, role="ADMIN")
+
+    response = client.patch(
+        f"/api/v1/organisations/{context['organisation_id']}/sla-policies/P1",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        json={
+            "first_response_minutes": 10,
+            "resolution_minutes": 120,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["priority"] == "P1"
+    assert response.json()["first_response_minutes"] == 10
+    assert response.json()["resolution_minutes"] == 120
+
+
+@pytest.mark.parametrize("role", ["AGENT", "REQUESTER"])
+def test_agent_and_requester_cannot_manage_sla_policies(
+    client,
+    db_session_factory,
+    role,
+):
+    context = create_ticket_context(db_session_factory, role=role)
+
+    response = client.get(
+        f"/api/v1/organisations/{context['organisation_id']}/sla-policies",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "response_minutes,resolution_minutes",
+    [
+        (0, 60),
+        (60, 0),
+        (-5, 60),
+        (60, -10),
+    ],
+)
+def test_sla_policy_rejects_non_positive_targets(
+    client,
+    db_session_factory,
+    response_minutes,
+    resolution_minutes,
+):
+    context = create_ticket_context(db_session_factory)
+
+    response = client.patch(
+        f"/api/v1/organisations/{context['organisation_id']}/sla-policies/P1",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        json={
+            "first_response_minutes": response_minutes,
+            "resolution_minutes": resolution_minutes,
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_updating_sla_policy_does_not_change_existing_ticket_deadlines(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+
+    ticket_response = create_ticket(client, context)
+    assert ticket_response.status_code == 201
+
+    ticket_id = ticket_response.json()["id"]
+
+    with db_session_factory() as db:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(TicketSLA.ticket_id == uuid.UUID(ticket_id))
+        )
+
+        original_response_due_at = ticket_sla.response_due_at
+        original_resolution_due_at = ticket_sla.resolution_due_at
+
+    update_response = client.patch(
+        f"/api/v1/organisations/{context['organisation_id']}/sla-policies/P1",
+        json={
+            "first_response_minutes": 5,
+            "resolution_minutes": 60,
+        },
+    )
+
+    assert update_response.status_code == 200
+
+    with db_session_factory() as db:
+        updated_ticket_sla = db.scalar(
+            select(TicketSLA).where(TicketSLA.ticket_id == uuid.UUID(ticket_id))
+        )
+
+        assert updated_ticket_sla.response_due_at == original_response_due_at
+        assert updated_ticket_sla.resolution_due_at == original_resolution_due_at
