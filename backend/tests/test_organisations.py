@@ -7,6 +7,7 @@ from sqlalchemy.pool import StaticPool
 from app.db.dependencies import get_db
 from app.main import app
 from app.models.organisation import Organisation
+from app.models.sla_policy import SLAPolicy
 
 
 @pytest.fixture
@@ -18,6 +19,7 @@ def client():
     )
 
     Organisation.__table__.create(bind=test_engine)
+    SLAPolicy.__table__.create(bind=test_engine)
 
     TestingSessionLocal = sessionmaker(
         autocommit=False,

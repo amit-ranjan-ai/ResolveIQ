@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -16,9 +16,11 @@ from app.db.dependencies import get_db
 from app.models.category import Category
 from app.models.organisation import Organisation
 from app.models.organisation_membership import OrganisationMembership
+from app.models.sla_policy import SLAPolicy
 from app.models.team import Team
 from app.models.team_membership import TeamMembership
 from app.models.ticket import Ticket
+from app.models.ticket_sla import TicketSLA
 from app.models.user import User
 from app.schemas.ticket import (
     TicketAssignmentUpdate,
@@ -263,6 +265,19 @@ def create_ticket(
         ticket_data.urgency,
     )
 
+    sla_policy = db.scalar(
+        select(SLAPolicy).where(
+            SLAPolicy.organisation_id == organisation_id,
+            SLAPolicy.priority == priority,
+        )
+    )
+
+    if sla_policy is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="SLA policy is not configured for this organisation.",
+        )
+
     ticket = Ticket(
         organisation_id=organisation_id,
         ticket_number=generate_ticket_number(),
@@ -274,6 +289,25 @@ def create_ticket(
     try:
         db.add(ticket)
         db.flush()
+
+        # Ensure the database-generated creation timestamp is available.
+        db.refresh(ticket, attribute_names=["created_at"])
+
+        ticket_sla = TicketSLA(
+            organisation_id=ticket.organisation_id,
+            ticket_id=ticket.id,
+            sla_policy_id=sla_policy.id,
+            first_response_minutes=sla_policy.first_response_minutes,
+            resolution_minutes=sla_policy.resolution_minutes,
+            response_due_at=ticket.created_at
+            + timedelta(minutes=sla_policy.first_response_minutes),
+            resolution_due_at=ticket.created_at
+            + timedelta(minutes=sla_policy.resolution_minutes),
+            response_breached=False,
+            resolution_breached=False,
+        )
+
+        db.add(ticket_sla)
 
         record_ticket_activity(
             db=db,
@@ -293,11 +327,6 @@ def create_ticket(
 
     except IntegrityError as error:
         db.rollback()
-
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Ticket could not be created because of a database conflict.",
-        ) from error
 
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -541,6 +570,18 @@ def update_ticket(
             ticket.resolved_at = None
             ticket.closed_at = None
 
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(
+                TicketSLA.organisation_id == ticket.organisation_id,
+                TicketSLA.ticket_id == ticket.id,
+            )
+        )
+
+        if ticket_sla is not None:
+            if ticket.status in ("Resolved", "Closed"):
+                ticket_sla.resolved_at = ticket.resolved_at or datetime.now(UTC)
+            else:
+                ticket_sla.resolved_at = None
     try:
         if ticket.status != old_status:
             record_ticket_activity(

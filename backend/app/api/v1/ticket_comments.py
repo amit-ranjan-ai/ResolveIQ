@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from app.core.dependencies import get_current_user
 from app.core.ticket_access import get_accessible_ticket
 from app.db.dependencies import get_db
 from app.models.ticket_comment import TicketComment
+from app.models.ticket_sla import TicketSLA
 from app.models.user import User
 from app.schemas.ticket_comment import (
     TicketCommentCreate,
@@ -53,6 +55,18 @@ def create_ticket_comment(
     )
 
     db.add(comment)
+
+    # Record the first public response from support staff.
+    if membership.role in ("OWNER", "ADMIN", "AGENT") and not comment_data.is_internal:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(
+                TicketSLA.organisation_id == ticket.organisation_id,
+                TicketSLA.ticket_id == ticket.id,
+            )
+        )
+
+        if ticket_sla is not None and ticket_sla.first_responded_at is None:
+            ticket_sla.first_responded_at = datetime.now(UTC)
 
     activity_type = (
         "INTERNAL_NOTE_ADDED" if comment_data.is_internal else "COMMENT_ADDED"

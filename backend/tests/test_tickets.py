@@ -14,10 +14,12 @@ from app.db.dependencies import get_db
 from app.main import app
 from app.models.organisation import Organisation
 from app.models.organisation_membership import OrganisationMembership
+from app.models.sla_policy import SLAPolicy
 from app.models.team import Team
 from app.models.team_membership import TeamMembership
 from app.models.ticket import Ticket
 from app.models.ticket_activity import TicketActivity
+from app.models.ticket_sla import TicketSLA
 from app.models.user import User
 
 
@@ -73,6 +75,24 @@ def create_ticket_context(
         )
 
         db.add(organisation)
+        db.flush()
+        default_sla_policies = [
+            ("P1", 15, 240),
+            ("P2", 30, 480),
+            ("P3", 240, 1440),
+            ("P4", 480, 4320),
+        ]
+
+        for priority, response_minutes, resolution_minutes in default_sla_policies:
+            db.add(
+                SLAPolicy(
+                    organisation_id=organisation.id,
+                    priority=priority,
+                    first_response_minutes=response_minutes,
+                    resolution_minutes=resolution_minutes,
+                )
+            )
+
         db.flush()
 
         caller = User(
@@ -191,6 +211,8 @@ def test_requester_can_create_own_ticket(client, db_session_factory):
     )
 
     response = create_ticket(client, context)
+
+    print("API ERROR:", response.text)
 
     assert response.status_code == 201
     assert (
@@ -997,6 +1019,154 @@ def test_owner_can_create_and_view_ticket_comments(
     assert list_response.status_code == 200
     assert len(list_response.json()) == 2
     assert list_response.json()[0]["message"] == ("We are investigating this issue.")
+
+
+def test_public_support_comment_records_first_sla_response(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = uuid.UUID(created.json()["id"])
+
+    response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "We are investigating this issue.",
+            "is_internal": False,
+        },
+    )
+
+    assert response.status_code == 201
+
+    with db_session_factory() as db:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(
+                TicketSLA.ticket_id == ticket_id,
+            )
+        )
+
+        assert ticket_sla is not None
+        assert ticket_sla.first_responded_at is not None
+
+
+def test_internal_note_does_not_record_first_sla_response(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = uuid.UUID(created.json()["id"])
+
+    response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Internal investigation note.",
+            "is_internal": True,
+        },
+    )
+
+    assert response.status_code == 201
+
+    with db_session_factory() as db:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(
+                TicketSLA.ticket_id == ticket_id,
+            )
+        )
+
+        assert ticket_sla is not None
+        assert ticket_sla.first_responded_at is None
+
+
+def test_requester_comment_does_not_record_first_sla_response(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+        role="REQUESTER",
+    )
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = uuid.UUID(created.json()["id"])
+
+    response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "I am still experiencing this issue.",
+            "is_internal": False,
+        },
+    )
+
+    assert response.status_code == 201
+
+    with db_session_factory() as db:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(
+                TicketSLA.ticket_id == ticket_id,
+            )
+        )
+
+        assert ticket_sla is not None
+        assert ticket_sla.first_responded_at is None
+
+
+def test_second_support_comment_does_not_overwrite_first_response(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = uuid.UUID(created.json()["id"])
+
+    first_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "First support response.",
+            "is_internal": False,
+        },
+    )
+
+    assert first_response.status_code == 201
+
+    with db_session_factory() as db:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(
+                TicketSLA.ticket_id == ticket_id,
+            )
+        )
+        original_timestamp = ticket_sla.first_responded_at
+
+    second_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Second support response.",
+            "is_internal": False,
+        },
+    )
+
+    assert second_response.status_code == 201
+
+    with db_session_factory() as db:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(
+                TicketSLA.ticket_id == ticket_id,
+            )
+        )
+
+        assert ticket_sla.first_responded_at == original_timestamp
 
 
 def test_requester_can_only_view_public_ticket_comments(
@@ -1981,6 +2151,14 @@ def test_resolving_ticket_sets_resolved_at(
     assert response.json()["resolved_at"] is not None
     assert response.json()["closed_at"] is None
 
+    with db_session_factory() as db:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(TicketSLA.ticket_id == uuid.UUID(ticket_id))
+        )
+
+        assert ticket_sla is not None
+        assert ticket_sla.resolved_at is not None
+
 
 def test_closing_ticket_sets_closed_at(
     client,
@@ -2003,6 +2181,14 @@ def test_closing_ticket_sets_closed_at(
     assert response.json()["status"] == "Closed"
     assert response.json()["closed_at"] is not None
     assert response.json()["resolved_at"] is None
+
+    with db_session_factory() as db:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(TicketSLA.ticket_id == uuid.UUID(ticket_id))
+        )
+
+        assert ticket_sla is not None
+        assert ticket_sla.resolved_at is not None
 
 
 def test_reopening_ticket_clears_resolution_timestamps(
@@ -2036,3 +2222,11 @@ def test_reopening_ticket_clears_resolution_timestamps(
     assert reopened_response.json()["status"] == "Reopened"
     assert reopened_response.json()["resolved_at"] is None
     assert reopened_response.json()["closed_at"] is None
+
+    with db_session_factory() as db:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(TicketSLA.ticket_id == uuid.UUID(ticket_id))
+        )
+
+        assert ticket_sla is not None
+        assert ticket_sla.resolved_at is None

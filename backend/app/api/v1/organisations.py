@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.db.dependencies import get_db
 from app.models.organisation import Organisation
+from app.models.sla_policy import SLAPolicy
 from app.schemas.organisation import (
     OrganisationCreate,
     OrganisationReplace,
@@ -33,10 +34,44 @@ def create_organisation(
 ):
     organisation = Organisation(**organisation_data.model_dump())
 
+    default_sla_policies = [
+        {
+            "priority": "P1",
+            "first_response_minutes": 15,
+            "resolution_minutes": 240,
+        },
+        {
+            "priority": "P2",
+            "first_response_minutes": 30,
+            "resolution_minutes": 480,
+        },
+        {
+            "priority": "P3",
+            "first_response_minutes": 240,
+            "resolution_minutes": 1440,
+        },
+        {
+            "priority": "P4",
+            "first_response_minutes": 480,
+            "resolution_minutes": 4320,
+        },
+    ]
+
     try:
         db.add(organisation)
+        db.flush()
+
+        for policy_data in default_sla_policies:
+            db.add(
+                SLAPolicy(
+                    organisation_id=organisation.id,
+                    **policy_data,
+                )
+            )
+
         db.commit()
         db.refresh(organisation)
+
     except IntegrityError as error:
         db.rollback()
         raise HTTPException(
