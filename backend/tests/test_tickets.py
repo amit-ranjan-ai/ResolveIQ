@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,8 +20,13 @@ from app.models.team import Team
 from app.models.team_membership import TeamMembership
 from app.models.ticket import Ticket
 from app.models.ticket_activity import TicketActivity
+from app.models.ticket_escalation import TicketEscalation
 from app.models.ticket_sla import TicketSLA
 from app.models.user import User
+from app.services.ticket_escalation import (
+    get_escalation_recipient,
+    process_sla_escalations,
+)
 
 
 @pytest.fixture
@@ -2389,3 +2395,293 @@ def test_updating_sla_policy_does_not_change_existing_ticket_deadlines(
 
         assert updated_ticket_sla.response_due_at == original_response_due_at
         assert updated_ticket_sla.resolution_due_at == original_resolution_due_at
+
+
+def test_process_sla_escalations_and_prevent_duplicates(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    response = create_ticket(client, context)
+
+    assert response.status_code == 201
+
+    organisation_id = uuid.UUID(context["organisation_id"])
+    ticket_id = uuid.UUID(response.json()["id"])
+
+    with db_session_factory() as db:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(
+                TicketSLA.organisation_id == organisation_id,
+                TicketSLA.ticket_id == ticket_id,
+            )
+        )
+
+        assert ticket_sla is not None
+
+        current_time = datetime.now(UTC)
+
+        ticket_sla.response_due_at = current_time - timedelta(minutes=5)
+        ticket_sla.resolution_due_at = current_time - timedelta(minutes=5)
+
+        db.commit()
+
+    with db_session_factory() as db:
+        created_count = process_sla_escalations(
+            db=db,
+            current_time=current_time,
+        )
+
+    assert created_count == 2
+
+    with db_session_factory() as db:
+        escalations = db.scalars(
+            select(TicketEscalation).where(
+                TicketEscalation.organisation_id == organisation_id,
+                TicketEscalation.ticket_id == ticket_id,
+            )
+        ).all()
+
+        assert len(escalations) == 2
+        assert {escalation.target_type for escalation in escalations} == {
+            "RESPONSE",
+            "RESOLUTION",
+        }
+        assert all(
+            escalation.escalation_level == "BREACHED" for escalation in escalations
+        )
+
+    with db_session_factory() as db:
+        duplicate_count = process_sla_escalations(
+            db=db,
+            current_time=current_time,
+        )
+
+    assert duplicate_count == 0
+
+
+def test_create_at_risk_sla_escalation(client, db_session_factory):
+    context = create_ticket_context(db_session_factory)
+    response = create_ticket(client, context)
+
+    assert response.status_code == 201
+
+    organisation_id = uuid.UUID(context["organisation_id"])
+    ticket_id = uuid.UUID(response.json()["id"])
+
+    with db_session_factory() as db:
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(
+                TicketSLA.organisation_id == organisation_id,
+                TicketSLA.ticket_id == ticket_id,
+            )
+        )
+
+        assert ticket_sla is not None
+
+        current_time = datetime.now(UTC)
+
+        ticket_sla.response_due_at = current_time + timedelta(minutes=2)
+        ticket_sla.resolution_due_at = current_time + timedelta(days=2)
+
+        db.commit()
+
+    with db_session_factory() as db:
+        created_count = process_sla_escalations(
+            db=db,
+            current_time=current_time,
+        )
+
+        assert created_count == 1
+
+        escalation = db.scalar(
+            select(TicketEscalation).where(
+                TicketEscalation.organisation_id == organisation_id,
+                TicketEscalation.ticket_id == ticket_id,
+            )
+        )
+
+        assert escalation is not None
+        assert escalation.target_type == "RESPONSE"
+        assert escalation.escalation_level == "AT_RISK"
+        assert escalation.status == "PENDING"
+
+
+def test_get_escalation_recipient_prefers_team_lead(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    response = create_ticket(client, context)
+
+    assert response.status_code == 201
+
+    organisation_id = uuid.UUID(context["organisation_id"])
+    ticket_id = uuid.UUID(response.json()["id"])
+
+    with db_session_factory() as db:
+        ticket = db.get(Ticket, ticket_id)
+
+        assert ticket is not None
+
+        _, agent_membership = create_member(
+            db,
+            organisation_id,
+            "AGENT",
+        )
+        _, team_lead_membership = create_member(
+            db,
+            organisation_id,
+            "AGENT",
+        )
+
+        team = Team(
+            organisation_id=organisation_id,
+            name="Escalation Team",
+            description="Team for escalation testing",
+            is_active=True,
+            team_lead_membership_id=team_lead_membership.id,
+        )
+
+        db.add(team)
+        db.flush()
+
+        db.add_all(
+            [
+                TeamMembership(
+                    organisation_id=organisation_id,
+                    team_id=team.id,
+                    organisation_membership_id=agent_membership.id,
+                ),
+                TeamMembership(
+                    organisation_id=organisation_id,
+                    team_id=team.id,
+                    organisation_membership_id=team_lead_membership.id,
+                ),
+            ]
+        )
+
+        ticket.assigned_team_id = team.id
+        ticket.assigned_agent_membership_id = agent_membership.id
+
+        db.flush()
+
+        recipient = get_escalation_recipient(ticket, db)
+
+        assert recipient is not None
+        assert recipient.id == team_lead_membership.id
+
+
+def test_get_escalation_recipient_falls_back_to_assigned_agent(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    response = create_ticket(client, context)
+
+    assert response.status_code == 201
+
+    organisation_id = uuid.UUID(context["organisation_id"])
+    ticket_id = uuid.UUID(response.json()["id"])
+
+    with db_session_factory() as db:
+        ticket = db.get(Ticket, ticket_id)
+
+        assert ticket is not None
+
+        _, agent_membership = create_member(
+            db,
+            organisation_id,
+            "AGENT",
+        )
+
+        ticket.assigned_agent_membership_id = agent_membership.id
+        db.flush()
+
+        recipient = get_escalation_recipient(ticket, db)
+
+        assert recipient is not None
+        assert recipient.id == agent_membership.id
+
+
+def test_get_escalation_recipient_falls_back_to_owner(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    response = create_ticket(client, context)
+
+    assert response.status_code == 201
+
+    ticket_id = uuid.UUID(response.json()["id"])
+
+    with db_session_factory() as db:
+        ticket = db.get(Ticket, ticket_id)
+
+        assert ticket is not None
+
+        owner = db.get(
+            OrganisationMembership,
+            uuid.UUID(context["caller_membership_id"]),
+        )
+
+        assert owner is not None
+
+        recipient = get_escalation_recipient(ticket, db)
+
+        assert recipient is not None
+        assert recipient.id == owner.id
+        assert recipient.role == "OWNER"
+
+
+def test_escalation_skipped_when_no_eligible_recipient(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    response = create_ticket(client, context)
+
+    assert response.status_code == 201
+
+    organisation_id = uuid.UUID(context["organisation_id"])
+    ticket_id = uuid.UUID(response.json()["id"])
+
+    with db_session_factory() as db:
+        owner = db.get(
+            OrganisationMembership,
+            uuid.UUID(context["caller_membership_id"]),
+        )
+
+        assert owner is not None
+        owner.is_active = False
+
+        ticket_sla = db.scalar(
+            select(TicketSLA).where(
+                TicketSLA.organisation_id == organisation_id,
+                TicketSLA.ticket_id == ticket_id,
+            )
+        )
+
+        assert ticket_sla is not None
+
+        current_time = datetime.now(UTC)
+        ticket_sla.response_due_at = current_time - timedelta(minutes=5)
+
+        db.commit()
+
+    with db_session_factory() as db:
+        created_count = process_sla_escalations(
+            db=db,
+            current_time=current_time,
+        )
+
+        assert created_count == 0
+
+        escalations = db.scalars(
+            select(TicketEscalation).where(
+                TicketEscalation.organisation_id == organisation_id,
+                TicketEscalation.ticket_id == ticket_id,
+            )
+        ).all()
+
+        assert escalations == []

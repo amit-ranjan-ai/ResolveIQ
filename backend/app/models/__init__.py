@@ -8,6 +8,7 @@ from app.models.ticket import Ticket
 from app.models.ticket_activity import TicketActivity
 from app.models.ticket_attachment import TicketAttachment
 from app.models.ticket_comment import TicketComment
+from app.models.ticket_escalation import TicketEscalation
 from app.models.ticket_sla import TicketSLA
 from app.models.user import User
 
@@ -22,6 +23,7 @@ __all__ = [
     "TicketActivity",
     "TicketAttachment",
     "TicketComment",
+    "TicketEscalation",
     "TicketSLA",
     "User",
 ]
