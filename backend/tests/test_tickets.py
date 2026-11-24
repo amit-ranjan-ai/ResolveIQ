@@ -2230,3 +2230,46 @@ def test_reopening_ticket_clears_resolution_timestamps(
 
         assert ticket_sla is not None
         assert ticket_sla.resolved_at is None
+
+
+def test_get_ticket_sla_monitoring(client, db_session_factory):
+    context = create_ticket_context(db_session_factory)
+
+    ticket_response = create_ticket(client, context)
+
+    assert ticket_response.status_code == 201
+
+    ticket_id = ticket_response.json()["id"]
+
+    response = client.get(f"/api/v1/tickets/{ticket_id}/sla")
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["ticket_id"] == ticket_id
+    assert data["organisation_id"] == context["organisation_id"]
+    assert data["ticket_priority"] == "P1"
+    assert data["response_status"] == "ON_TRACK"
+    assert data["resolution_status"] == "ON_TRACK"
+    assert data["response_breached"] is False
+    assert data["resolution_breached"] is False
+
+
+def test_user_cannot_access_another_organisations_ticket_sla(
+    client,
+    db_session_factory,
+):
+    first_context = create_ticket_context(db_session_factory)
+    first_ticket = create_ticket(client, first_context)
+
+    assert first_ticket.status_code == 201
+    ticket_id = first_ticket.json()["id"]
+
+    second_context = create_ticket_context(db_session_factory)
+
+    client.headers.update({"Authorization": f"Bearer {second_context['access_token']}"})
+
+    response = client.get(f"/api/v1/tickets/{ticket_id}/sla")
+
+    assert response.status_code == 403
