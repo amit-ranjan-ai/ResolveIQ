@@ -1,5 +1,4 @@
-
-import { useState } from "react"
+import { useEffect, useState } from "react";
 import {
   Ticket,
   CircleDot,
@@ -12,241 +11,352 @@ import {
   Eye,
   History,
   Activity,
-} from "lucide-react"
+  RefreshCw,
+} from "lucide-react";
 
 import {
   CreateTicketDialog,
   type CreateTicketData,
-} from "@/components/layout/create-ticket-dialog"
+} from "@/components/layout/create-ticket-dialog";
 
-interface TicketRecord {
-  id: string
-  subject: string
-  description?: string
-  category: string
-  priority: string
-  status: string
-  requester: string
-  date: string
-}
+import { useOrganisation } from "@/contexts/organisation-context";
+import {
+  getOrganisationTickets,
+  createOrganisationTicket,
+  updateTicket,
+  type OrganisationTicket,
+} from "@/services/tickets";
+import { getMyOrganisationMembership } from "@/services/organisation-memberships";
+import {
+  getTicketActivities,
+  type TicketActivity,
+} from "@/services/ticket-activities";
 
-interface TicketActivity {
-  message: string
-  date: string
-}
+function getPriorityLabel(priority: string) {
+  const labels: Record<string, string> = {
+    P1: "Critical",
+    P2: "High",
+    P3: "Medium",
+    P4: "Low",
+  };
 
-const initialTickets: TicketRecord[] = [
-  {
-    id: "INC-1024",
-    subject: "Unable to access company VPN",
-    description:
-      "The employee cannot connect to the company VPN while working remotely. The VPN connection fails during authentication.",
-    category: "Network",
-    priority: "High",
-    status: "Open",
-    requester: "John Smith",
-    date: "21 Nov 2026",
-  },
-  {
-    id: "INC-1023",
-    subject: "Laptop performance is very slow",
-    description:
-      "The employee reports slow laptop performance when opening applications and switching between tasks.",
-    category: "Hardware",
-    priority: "Medium",
-    status: "In Progress",
-    requester: "Sarah Johnson",
-    date: "21 Nov 2026",
-  },
-  {
-    id: "INC-1022",
-    subject: "Email synchronization issue",
-    description:
-      "Emails are not synchronizing correctly with the desktop email application.",
-    category: "Software",
-    priority: "Low",
-    status: "Resolved",
-    requester: "Michael Brown",
-    date: "20 Nov 2026",
-  },
-  {
-    id: "INC-1021",
-    subject: "Unable to install required software",
-    description:
-      "The employee needs assistance installing required company software.",
-    category: "Software",
-    priority: "Medium",
-    status: "Open",
-    requester: "Emily Davis",
-    date: "20 Nov 2026",
-  },
-  {
-    id: "INC-1020",
-    subject: "Printer not responding",
-    description:
-      "The office printer is not responding to print requests.",
-    category: "Hardware",
-    priority: "Low",
-    status: "Resolved",
-    requester: "David Wilson",
-    date: "19 Nov 2026",
-  },
-]
-
-function getStatusStyle(status: string) {
-  switch (status) {
-    case "Open":
-      return "bg-orange-500/10 text-orange-600"
-    case "In Progress":
-      return "bg-blue-500/10 text-blue-600"
-    case "Resolved":
-      return "bg-green-500/10 text-green-600"
-    default:
-      return "bg-muted text-muted-foreground"
-  }
+  return labels[priority] ?? priority;
 }
 
 function getPriorityStyle(priority: string) {
   switch (priority) {
-    case "Critical":
-      return "text-red-700 font-bold"
-    case "High":
-      return "text-red-600"
-    case "Medium":
-      return "text-orange-600"
-    case "Low":
-      return "text-green-600"
+    case "P1":
+      return "text-red-700 font-bold";
+    case "P2":
+      return "text-red-600";
+    case "P3":
+      return "text-orange-600";
+    case "P4":
+      return "text-green-600";
     default:
-      return "text-muted-foreground"
+      return "text-muted-foreground";
   }
 }
 
-function getCurrentDateTime() {
-  return new Date().toLocaleString("en-IN", {
+function getStatusStyle(status: string) {
+  switch (status) {
+    case "Open":
+      return "bg-orange-500/10 text-orange-600";
+    case "Assigned":
+    case "In Progress":
+      return "bg-blue-500/10 text-blue-600";
+    case "Pending":
+      return "bg-yellow-500/10 text-yellow-700";
+    case "Resolved":
+      return "bg-green-500/10 text-green-600";
+    case "Closed":
+      return "bg-muted text-muted-foreground";
+    case "Reopened":
+      return "bg-purple-500/10 text-purple-600";
+    default:
+      return "bg-muted text-muted-foreground";
+  }
+}
+
+function formatDate(date: string) {
+  return new Date(date).toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+function formatDateTime(date: string) {
+  return new Date(date).toLocaleString("en-IN", {
     day: "2-digit",
     month: "short",
     year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
-  })
+  });
 }
 
+const availableStatuses = [
+  "Open",
+  "Assigned",
+  "In Progress",
+  "Pending",
+  "Resolved",
+  "Closed",
+  "Reopened",
+];
+
 export function Tickets() {
-  const [tickets, setTickets] = useState<TicketRecord[]>(initialTickets)
-  const [search, setSearch] = useState("")
-  const [statusFilter, setStatusFilter] = useState("All")
-  const [dialogOpen, setDialogOpen] = useState(false)
+  const { selectedOrganisationId } = useOrganisation();
+
+  const [tickets, setTickets] = useState<OrganisationTicket[]>([]);
+  const [membershipId, setMembershipId] = useState("");
+  const [activities, setActivities] = useState<TicketActivity[]>([]);
+
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("All");
+
+  const [dialogOpen, setDialogOpen] = useState(false);
   const [selectedTicket, setSelectedTicket] =
-    useState<TicketRecord | null>(null)
+    useState<OrganisationTicket | null>(null);
 
-  const [activities, setActivities] = useState<
-    Record<string, TicketActivity[]>
-  >(
-    Object.fromEntries(
-      initialTickets.map((ticket) => [
-        ticket.id,
-        [{ message: "Ticket created", date: ticket.date }],
-      ]),
-    ),
-  )
+  const [isLoading, setIsLoading] = useState(true);
+  const [isCreating, setIsCreating] = useState(false);
+  const [updatingTicketId, setUpdatingTicketId] = useState("");
+  const [isLoadingActivities, setIsLoadingActivities] = useState(false);
 
-  function handleCreateTicket(data: CreateTicketData) {
-    const nextNumber =
-      Math.max(
-        ...tickets.map((ticket) => Number(ticket.id.replace("INC-", ""))),
-        1024,
-      ) + 1
+  const [error, setError] = useState("");
+  const [membershipError, setMembershipError] = useState("");
+  const [actionError, setActionError] = useState("");
 
-    const newTicket: TicketRecord = {
-      id: `INC-${nextNumber}`,
-      subject: data.subject,
-      description: data.description,
-      category: data.category,
-      priority: data.priority,
-      status: "Open",
-      requester: data.requester,
-      date: new Date().toLocaleDateString("en-GB", {
-        day: "2-digit",
-        month: "short",
-        year: "numeric",
-      }),
+  async function loadTickets(organisationId: string) {
+    setIsLoading(true);
+    setError("");
+
+    try {
+      const data = await getOrganisationTickets(organisationId);
+      setTickets(data);
+    } catch (err) {
+      console.error("Failed to load tickets:", err);
+      setError("Unable to load tickets. Please try again.");
+    } finally {
+      setIsLoading(false);
     }
-
-    setTickets((previousTickets) => [
-      newTicket,
-      ...previousTickets,
-    ])
-
-    setActivities((previousActivities) => ({
-      ...previousActivities,
-      [newTicket.id]: [
-        {
-          message: "Ticket created",
-          date: getCurrentDateTime(),
-        },
-      ],
-    }))
-
-    setDialogOpen(false)
   }
 
-  function handleStatusChange(
-    ticketId: string,
-    newStatus: string,
-  ) {
-    const currentTicket = tickets.find(
-      (ticket) => ticket.id === ticketId,
-    )
-
-    if (!currentTicket || currentTicket.status === newStatus) {
-      return
+  useEffect(() => {
+    if (!selectedOrganisationId) {
+      setTickets([]);
+      setIsLoading(false);
+      return;
     }
 
-    const previousStatus = currentTicket.status
+    let active = true;
 
-    setTickets((previousTickets) =>
-      previousTickets.map((ticket) =>
-        ticket.id === ticketId
-          ? { ...ticket, status: newStatus }
-          : ticket,
-      ),
-    )
+    async function fetchTickets() {
+      setIsLoading(true);
+      setError("");
 
-    setActivities((previousActivities) => ({
-      ...previousActivities,
-      [ticketId]: [
-        {
-          message: `Status changed from ${previousStatus} to ${newStatus}`,
-          date: getCurrentDateTime(),
-        },
-        ...(previousActivities[ticketId] ?? []),
-      ],
-    }))
+      try {
+        const data = await getOrganisationTickets(selectedOrganisationId);
 
-    setSelectedTicket((previousTicket) =>
-      previousTicket?.id === ticketId
-        ? { ...previousTicket, status: newStatus }
-        : previousTicket,
-    )
+        if (active) {
+          setTickets(data);
+        }
+      } catch (err) {
+        console.error("Failed to load tickets:", err);
+
+        if (active) {
+          setError("Unable to load tickets. Please try again.");
+          setTickets([]);
+        }
+      } finally {
+        if (active) {
+          setIsLoading(false);
+        }
+      }
+    }
+
+    void fetchTickets();
+
+    return () => {
+      active = false;
+    };
+  }, [selectedOrganisationId]);
+
+  useEffect(() => {
+    if (!selectedOrganisationId) {
+      setMembershipId("");
+      return;
+    }
+
+    let active = true;
+
+    async function fetchMembership() {
+      setMembershipError("");
+
+      try {
+        const membership = await getMyOrganisationMembership(
+          selectedOrganisationId,
+        );
+
+        if (active) {
+          setMembershipId(membership.id);
+        }
+      } catch (err) {
+        console.error("Failed to load organisation membership:", err);
+
+        if (active) {
+          setMembershipId("");
+          setMembershipError(
+            "Your active organisation membership could not be loaded.",
+          );
+        }
+      }
+    }
+
+    void fetchMembership();
+
+    return () => {
+      active = false;
+    };
+  }, [selectedOrganisationId]);
+
+  useEffect(() => {
+    if (!selectedTicket) {
+      setActivities([]);
+      setIsLoadingActivities(false);
+      return;
+    }
+
+    // Capture the ID before the asynchronous function.
+    // This prevents TypeScript from treating selectedTicket as nullable.
+    const ticketId = selectedTicket.id;
+
+    let active = true;
+
+    async function fetchActivities() {
+      setIsLoadingActivities(true);
+      setActionError("");
+
+      try {
+        const data = await getTicketActivities(ticketId);
+
+        if (active) {
+          setActivities(data);
+        }
+      } catch (err) {
+        console.error("Failed to load ticket activities:", err);
+
+        if (active) {
+          setActivities([]);
+          setActionError("Unable to load ticket activity history.");
+        }
+      } finally {
+        if (active) {
+          setIsLoadingActivities(false);
+        }
+      }
+    }
+
+    void fetchActivities();
+
+    return () => {
+      active = false;
+    };
+  }, [selectedTicket?.id]);
+
+  async function handleCreateTicket(data: CreateTicketData): Promise<boolean> {
+    if (!selectedOrganisationId || !membershipId) {
+      setMembershipError(
+        "Your organisation membership is not available. Please try refreshing.",
+      );
+      return false;
+    }
+
+    setIsCreating(true);
+    setActionError("");
+
+    try {
+      const newTicket = await createOrganisationTicket(selectedOrganisationId, {
+        requester_membership_id: membershipId,
+        category_id: null,
+        subject: data.subject,
+        description: data.description,
+        impact: data.impact,
+        urgency: data.urgency,
+        source: "WEB",
+      });
+
+      setTickets((previous) => [newTicket, ...previous]);
+      setDialogOpen(false);
+
+      return true;
+    } catch (err) {
+      console.error("Failed to create ticket:", err);
+      setActionError(
+        "Ticket creation failed. Please check your details and try again.",
+      );
+
+      return false;
+    } finally {
+      setIsCreating(false);
+    }
+  }
+
+  async function handleStatusChange(ticketId: string, newStatus: string) {
+    const currentTicket = tickets.find((ticket) => ticket.id === ticketId);
+
+    if (
+      !currentTicket ||
+      currentTicket.status === newStatus ||
+      updatingTicketId
+    ) {
+      return;
+    }
+
+    setUpdatingTicketId(ticketId);
+    setActionError("");
+
+    try {
+      const updatedTicket = await updateTicket(ticketId, {
+        status: newStatus,
+      });
+
+      setTickets((previous) =>
+        previous.map((ticket) =>
+          ticket.id === ticketId ? updatedTicket : ticket,
+        ),
+      );
+
+      setSelectedTicket((previous) =>
+        previous?.id === ticketId ? updatedTicket : previous,
+      );
+    } catch (err) {
+      console.error("Failed to update ticket:", err);
+      setActionError("Unable to update ticket status. Please try again.");
+    } finally {
+      setUpdatingTicketId("");
+    }
   }
 
   const filteredTickets = tickets.filter((ticket) => {
     const matchesSearch = [
-      ticket.id,
+      ticket.ticket_number,
       ticket.subject,
-      ticket.description ?? "",
-      ticket.category,
-      ticket.requester,
+      ticket.description,
+      ticket.status,
+      getPriorityLabel(ticket.priority),
     ]
       .join(" ")
       .toLowerCase()
-      .includes(search.toLowerCase())
+      .includes(search.toLowerCase());
 
     const matchesStatus =
-      statusFilter === "All" || ticket.status === statusFilter
+      statusFilter === "All" || ticket.status === statusFilter;
 
-    return matchesSearch && matchesStatus
-  })
+    return matchesSearch && matchesStatus;
+  });
 
   const summaryCards = [
     {
@@ -265,9 +375,7 @@ export function Tickets() {
     },
     {
       label: "In Progress",
-      value: tickets.filter(
-        (ticket) => ticket.status === "In Progress",
-      ).length,
+      value: tickets.filter((ticket) => ticket.status === "In Progress").length,
       icon: Clock,
       color: "text-blue-600",
       background: "bg-blue-500/10",
@@ -275,13 +383,13 @@ export function Tickets() {
     {
       label: "Resolved",
       value: tickets.filter(
-        (ticket) => ticket.status === "Resolved",
+        (ticket) => ticket.status === "Resolved" || ticket.status === "Closed",
       ).length,
       icon: CheckCircle2,
       color: "text-green-600",
       background: "bg-green-500/10",
     },
-  ]
+  ];
 
   return (
     <div className="space-y-6">
@@ -295,25 +403,63 @@ export function Tickets() {
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => setDialogOpen(true)}
-          className="inline-flex items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-        >
-          <Plus className="size-4" />
-          Create Ticket
-        </button>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => void loadTickets(selectedOrganisationId)}
+            disabled={!selectedOrganisationId || isLoading}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border px-3 py-2.5 text-sm font-medium transition-colors hover:bg-accent disabled:opacity-50"
+          >
+            <RefreshCw
+              className={`size-4 ${isLoading ? "animate-spin" : ""}`}
+            />
+            Refresh
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setDialogOpen(true)}
+            disabled={!selectedOrganisationId || !membershipId}
+            className="inline-flex items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+          >
+            <Plus className="size-4" />
+            Create Ticket
+          </button>
+        </div>
       </div>
 
-      <div className="rounded-lg border border-dashed px-4 py-3 text-xs text-muted-foreground">
-        Sample tickets and newly created tickets are stored in frontend
-        memory only. They will not survive a page refresh until backend
-        integration.
-      </div>
+      {error && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-red-500/20 bg-red-500/5 px-4 py-3 text-sm text-red-600">
+          <span>{error}</span>
+          <button
+            type="button"
+            onClick={() => {
+              if (selectedOrganisationId) {
+                void loadTickets(selectedOrganisationId);
+              }
+            }}
+            className="font-semibold underline"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
+      {membershipError && (
+        <div className="rounded-lg border border-orange-500/20 bg-orange-500/5 px-4 py-3 text-sm text-orange-700">
+          {membershipError}
+        </div>
+      )}
+
+      {actionError && (
+        <div className="rounded-lg border border-red-500/20 bg-red-500/5 px-4 py-3 text-sm text-red-600">
+          {actionError}
+        </div>
+      )}
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {summaryCards.map((card) => {
-          const Icon = card.icon
+          const Icon = card.icon;
 
           return (
             <div
@@ -333,10 +479,10 @@ export function Tickets() {
               </div>
 
               <p className="mt-4 text-3xl font-bold tracking-tight">
-                {card.value}
+                {isLoading ? "—" : card.value}
               </p>
             </div>
-          )
+          );
         })}
       </div>
 
@@ -369,16 +515,16 @@ export function Tickets() {
 
                 <select
                   value={statusFilter}
-                  onChange={(event) =>
-                    setStatusFilter(event.target.value)
-                  }
+                  onChange={(event) => setStatusFilter(event.target.value)}
                   aria-label="Filter tickets by status"
                   className="h-10 min-w-0 bg-transparent text-sm outline-none"
                 >
                   <option value="All">All statuses</option>
-                  <option value="Open">Open</option>
-                  <option value="In Progress">In Progress</option>
-                  <option value="Resolved">Resolved</option>
+                  {availableStatuses.map((status) => (
+                    <option key={status} value={status}>
+                      {status}
+                    </option>
+                  ))}
                 </select>
               </div>
             </div>
@@ -391,7 +537,6 @@ export function Tickets() {
               <tr>
                 <th className="px-5 py-4 font-medium">Ticket</th>
                 <th className="px-5 py-4 font-medium">Requester</th>
-                <th className="px-5 py-4 font-medium">Category</th>
                 <th className="px-5 py-4 font-medium">Priority</th>
                 <th className="px-5 py-4 font-medium">Status</th>
                 <th className="px-5 py-4 font-medium">Created</th>
@@ -411,7 +556,7 @@ export function Tickets() {
                       className="text-left"
                     >
                       <span className="font-semibold text-primary hover:underline">
-                        {ticket.id}
+                        {ticket.ticket_number}
                       </span>
                       <span className="mt-1 block text-xs text-muted-foreground">
                         {ticket.subject}
@@ -420,52 +565,61 @@ export function Tickets() {
                   </td>
 
                   <td className="px-5 py-4 font-medium">
-                    {ticket.requester}
-                  </td>
-
-                  <td className="px-5 py-4 text-muted-foreground">
-                    {ticket.category}
+                    {ticket.requester_membership_id === membershipId
+                      ? "You"
+                      : "Organisation member"}
                   </td>
 
                   <td className="px-5 py-4">
-                    <span
-                      className={`font-semibold ${getPriorityStyle(ticket.priority)}`}
-                    >
-                      {ticket.priority}
+                    <span className={getPriorityStyle(ticket.priority)}>
+                      {getPriorityLabel(ticket.priority)}
                     </span>
                   </td>
 
                   <td className="px-5 py-4">
                     <select
                       value={ticket.status}
+                      disabled={updatingTicketId === ticket.id}
                       onChange={(event) =>
-                        handleStatusChange(
-                          ticket.id,
-                          event.target.value,
-                        )
+                        void handleStatusChange(ticket.id, event.target.value)
                       }
-                      aria-label={`Update status for ${ticket.id}`}
-                      className={`rounded-full border-0 px-3 py-1.5 text-xs font-semibold outline-none focus:ring-2 focus:ring-primary/30 ${getStatusStyle(ticket.status)}`}
+                      aria-label={`Update status for ${ticket.ticket_number}`}
+                      className={`rounded-full border-0 px-3 py-1.5 text-xs font-semibold outline-none focus:ring-2 focus:ring-primary/30 disabled:opacity-50 ${getStatusStyle(ticket.status)}`}
                     >
-                      <option value="Open">Open</option>
-                      <option value="In Progress">In Progress</option>
-                      <option value="Resolved">Resolved</option>
+                      {availableStatuses.map((status) => (
+                        <option key={status} value={status}>
+                          {status}
+                        </option>
+                      ))}
                     </select>
                   </td>
 
                   <td className="px-5 py-4 text-muted-foreground">
-                    {ticket.date}
+                    {formatDate(ticket.created_at)}
                   </td>
                 </tr>
               ))}
 
-              {filteredTickets.length === 0 && (
+              {!isLoading && filteredTickets.length === 0 && (
                 <tr>
                   <td
-                    colSpan={6}
+                    colSpan={5}
                     className="px-5 py-12 text-center text-muted-foreground"
                   >
-                    No tickets found. Try another search or status filter.
+                    {tickets.length === 0
+                      ? "No tickets exist in this organisation yet."
+                      : "No tickets match your search or filter."}
+                  </td>
+                </tr>
+              )}
+
+              {isLoading && (
+                <tr>
+                  <td
+                    colSpan={5}
+                    className="px-5 py-12 text-center text-muted-foreground"
+                  >
+                    Loading tickets from ResolveIQ...
                   </td>
                 </tr>
               )}
@@ -480,6 +634,7 @@ export function Tickets() {
 
       <CreateTicketDialog
         open={dialogOpen}
+        isCreating={isCreating}
         onClose={() => setDialogOpen(false)}
         onCreate={handleCreateTicket}
       />
@@ -489,7 +644,7 @@ export function Tickets() {
           className="fixed inset-0 z-[110] flex items-center justify-center bg-black/50 p-4"
           onMouseDown={(event) => {
             if (event.target === event.currentTarget) {
-              setSelectedTicket(null)
+              setSelectedTicket(null);
             }
           }}
         >
@@ -508,7 +663,7 @@ export function Tickets() {
                   id="ticket-details-title"
                   className="mt-1 text-xl font-bold"
                 >
-                  {selectedTicket.id}
+                  {selectedTicket.ticket_number}
                 </h2>
               </div>
 
@@ -528,7 +683,7 @@ export function Tickets() {
                   {selectedTicket.subject}
                 </h3>
                 <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted-foreground">
-                  {selectedTicket.description || "No description provided."}
+                  {selectedTicket.description}
                 </p>
               </div>
 
@@ -536,14 +691,9 @@ export function Tickets() {
                 <div className="rounded-lg border p-4">
                   <p className="text-xs text-muted-foreground">Requester</p>
                   <p className="mt-1 font-semibold">
-                    {selectedTicket.requester}
-                  </p>
-                </div>
-
-                <div className="rounded-lg border p-4">
-                  <p className="text-xs text-muted-foreground">Category</p>
-                  <p className="mt-1 font-semibold">
-                    {selectedTicket.category}
+                    {selectedTicket.requester_membership_id === membershipId
+                      ? "You"
+                      : "Organisation member"}
                   </p>
                 </div>
 
@@ -552,14 +702,24 @@ export function Tickets() {
                   <p
                     className={`mt-1 font-semibold ${getPriorityStyle(selectedTicket.priority)}`}
                   >
-                    {selectedTicket.priority}
+                    {getPriorityLabel(selectedTicket.priority)}
                   </p>
                 </div>
 
                 <div className="rounded-lg border p-4">
+                  <p className="text-xs text-muted-foreground">Impact</p>
+                  <p className="mt-1 font-semibold">{selectedTicket.impact}</p>
+                </div>
+
+                <div className="rounded-lg border p-4">
+                  <p className="text-xs text-muted-foreground">Urgency</p>
+                  <p className="mt-1 font-semibold">{selectedTicket.urgency}</p>
+                </div>
+
+                <div className="rounded-lg border p-4 sm:col-span-2">
                   <p className="text-xs text-muted-foreground">Created Date</p>
                   <p className="mt-1 font-semibold">
-                    {selectedTicket.date}
+                    {formatDateTime(selectedTicket.created_at)}
                   </p>
                 </div>
               </div>
@@ -575,19 +735,26 @@ export function Tickets() {
                 <select
                   id="details-ticket-status"
                   value={selectedTicket.status}
+                  disabled={updatingTicketId === selectedTicket.id}
                   onChange={(event) =>
-                    handleStatusChange(
+                    void handleStatusChange(
                       selectedTicket.id,
                       event.target.value,
                     )
                   }
                   className={`mt-2 w-full rounded-lg border px-3 py-2 text-sm font-semibold outline-none focus:ring-2 focus:ring-primary/30 ${getStatusStyle(selectedTicket.status)}`}
                 >
-                  <option value="Open">Open</option>
-                  <option value="In Progress">In Progress</option>
-                  <option value="Resolved">Resolved</option>
+                  {availableStatuses.map((status) => (
+                    <option key={status} value={status}>
+                      {status}
+                    </option>
+                  ))}
                 </select>
               </div>
+
+              {actionError && (
+                <p className="text-sm text-red-600">{actionError}</p>
+              )}
 
               <div className="space-y-4">
                 <div className="flex items-center gap-2">
@@ -595,40 +762,40 @@ export function Tickets() {
                   <div>
                     <h3 className="font-semibold">Activity History</h3>
                     <p className="text-xs text-muted-foreground">
-                      Timeline of ticket events
+                      Actual events recorded by ResolveIQ
                     </p>
                   </div>
                 </div>
 
-                <div className="relative space-y-5 border-l-2 border-muted pl-5">
-                  {(activities[selectedTicket.id] ?? []).map(
-                    (activity, index) => (
-                      <div
-                        key={`${activity.date}-${index}`}
-                        className="relative"
-                      >
+                {isLoadingActivities ? (
+                  <p className="text-sm text-muted-foreground">
+                    Loading activity history...
+                  </p>
+                ) : (
+                  <div className="relative space-y-5 border-l-2 border-muted pl-5">
+                    {activities.map((activity) => (
+                      <div key={activity.id} className="relative">
                         <span className="absolute -left-[27px] top-1 flex size-4 items-center justify-center rounded-full border-2 border-background bg-primary">
                           <Activity className="size-2 text-primary-foreground" />
                         </span>
 
                         <p className="text-sm font-medium">
-                          {activity.message}
+                          {activity.description}
                         </p>
 
                         <p className="mt-1 text-xs text-muted-foreground">
-                          {activity.date}
+                          {formatDateTime(activity.created_at)}
                         </p>
                       </div>
-                    ),
-                  )}
+                    ))}
 
-                  {(!activities[selectedTicket.id] ||
-                    activities[selectedTicket.id].length === 0) && (
-                    <p className="text-sm text-muted-foreground">
-                      No activity recorded yet.
-                    </p>
-                  )}
-                </div>
+                    {activities.length === 0 && (
+                      <p className="text-sm text-muted-foreground">
+                        No activity recorded yet.
+                      </p>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -646,10 +813,5 @@ export function Tickets() {
         </div>
       )}
     </div>
-  )
+  );
 }
-
-
-
-
-

@@ -9,6 +9,7 @@ from app.api.v1.teams import router as teams_router
 from app.api.v1.ticket_activities import router as ticket_activities_router
 from app.api.v1.ticket_attachments import router as ticket_attachments_router
 from app.api.v1.ticket_comments import router as ticket_comments_router
+from app.api.v1.ticket_escalations import router as ticket_escalations_router
 from app.api.v1.ticket_sla import router as ticket_sla_router
 from app.api.v1.tickets import router as tickets_router
 from app.api.v1.users import router as users_router
@@ -27,6 +28,7 @@ api_router.include_router(ticket_activities_router)
 api_router.include_router(ticket_sla_router)
 api_router.include_router(sla_dashboard_router)
 api_router.include_router(sla_policies_router)
+api_router.include_router(ticket_escalations_router)
 
 
 @api_router.get("/status")

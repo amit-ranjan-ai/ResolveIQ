@@ -2685,3 +2685,281 @@ def test_escalation_skipped_when_no_eligible_recipient(
         ).all()
 
         assert escalations == []
+
+
+def test_owner_can_list_organisation_and_ticket_escalations(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    ticket_response = create_ticket(client, context)
+
+    assert ticket_response.status_code == 201
+    ticket_id = uuid.UUID(ticket_response.json()["id"])
+
+    with db_session_factory() as db:
+        for target_type in ("RESPONSE", "RESOLUTION"):
+            db.add(
+                TicketEscalation(
+                    organisation_id=uuid.UUID(context["organisation_id"]),
+                    ticket_id=ticket_id,
+                    recipient_membership_id=uuid.UUID(context["caller_membership_id"]),
+                    target_type=target_type,
+                    escalation_level="BREACHED",
+                    reason="Test escalation",
+                    status="PENDING",
+                )
+            )
+
+        db.commit()
+
+    organisation_response = client.get(
+        f"/api/v1/organisations/{context['organisation_id']}/ticket-escalations"
+    )
+
+    assert organisation_response.status_code == 200
+    assert len(organisation_response.json()) == 2
+
+    ticket_response = client.get(f"/api/v1/tickets/{ticket_id}/escalations")
+
+    assert ticket_response.status_code == 200
+    assert len(ticket_response.json()) == 2
+
+
+def test_agent_can_only_list_assigned_escalations(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    ticket_response = create_ticket(client, context)
+
+    assert ticket_response.status_code == 201
+    ticket_id = uuid.UUID(ticket_response.json()["id"])
+
+    with db_session_factory() as db:
+        agent_user, agent_membership = create_member(
+            db,
+            uuid.UUID(context["organisation_id"]),
+            "AGENT",
+        )
+        agent_membership_id = str(agent_membership.id)
+
+        db.add_all(
+            [
+                TicketEscalation(
+                    organisation_id=uuid.UUID(context["organisation_id"]),
+                    ticket_id=ticket_id,
+                    recipient_membership_id=agent_membership.id,
+                    target_type="RESPONSE",
+                    escalation_level="BREACHED",
+                    reason="Assigned escalation",
+                    status="PENDING",
+                ),
+                TicketEscalation(
+                    organisation_id=uuid.UUID(context["organisation_id"]),
+                    ticket_id=ticket_id,
+                    recipient_membership_id=uuid.UUID(context["caller_membership_id"]),
+                    target_type="RESOLUTION",
+                    escalation_level="BREACHED",
+                    reason="Other recipient escalation",
+                    status="PENDING",
+                ),
+            ]
+        )
+
+        db.commit()
+
+        agent_token = create_access_token(str(agent_user.id))
+
+    client.headers.update({"Authorization": f"Bearer {agent_token}"})
+
+    response = client.get(
+        f"/api/v1/organisations/{context['organisation_id']}/ticket-escalations"
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    assert response.json()[0]["recipient_membership_id"] == agent_membership_id
+
+
+def test_requester_cannot_list_ticket_escalations(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    ticket_response = create_ticket(client, context)
+
+    assert ticket_response.status_code == 201
+    ticket_id = ticket_response.json()["id"]
+
+    requester_token = create_access_token(context["requester_user_id"])
+
+    client.headers.update({"Authorization": f"Bearer {requester_token}"})
+
+    response = client.get(f"/api/v1/tickets/{ticket_id}/escalations")
+
+    assert response.status_code == 403
+
+
+def test_owner_can_acknowledge_and_resolve_escalation(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    ticket_response = create_ticket(client, context)
+
+    assert ticket_response.status_code == 201
+    ticket_id = uuid.UUID(ticket_response.json()["id"])
+
+    with db_session_factory() as db:
+        escalation = TicketEscalation(
+            organisation_id=uuid.UUID(context["organisation_id"]),
+            ticket_id=ticket_id,
+            recipient_membership_id=uuid.UUID(context["caller_membership_id"]),
+            target_type="RESPONSE",
+            escalation_level="BREACHED",
+            reason="Test escalation",
+            status="PENDING",
+        )
+        db.add(escalation)
+        db.commit()
+        escalation_id = str(escalation.id)
+
+    acknowledge_response = client.patch(
+        f"/api/v1/ticket-escalations/{escalation_id}/acknowledge"
+    )
+
+    assert acknowledge_response.status_code == 200
+    assert acknowledge_response.json()["status"] == "ACKNOWLEDGED"
+    assert acknowledge_response.json()["acknowledged_at"] is not None
+
+    resolve_response = client.patch(
+        f"/api/v1/ticket-escalations/{escalation_id}/resolve"
+    )
+
+    assert resolve_response.status_code == 200
+    assert resolve_response.json()["status"] == "RESOLVED"
+    assert resolve_response.json()["resolved_at"] is not None
+    assert resolve_response.json()["acknowledged_at"] is not None
+
+
+def test_escalation_rejects_repeated_acknowledgement_and_resolution(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    ticket_response = create_ticket(client, context)
+
+    ticket_id = uuid.UUID(ticket_response.json()["id"])
+
+    with db_session_factory() as db:
+        escalation = TicketEscalation(
+            organisation_id=uuid.UUID(context["organisation_id"]),
+            ticket_id=ticket_id,
+            recipient_membership_id=uuid.UUID(context["caller_membership_id"]),
+            target_type="RESPONSE",
+            escalation_level="BREACHED",
+            reason="Test escalation",
+            status="PENDING",
+        )
+        db.add(escalation)
+        db.commit()
+        escalation_id = str(escalation.id)
+
+    first_acknowledgement = client.patch(
+        f"/api/v1/ticket-escalations/{escalation_id}/acknowledge"
+    )
+    assert first_acknowledgement.status_code == 200
+
+    second_acknowledgement = client.patch(
+        f"/api/v1/ticket-escalations/{escalation_id}/acknowledge"
+    )
+    assert second_acknowledgement.status_code == 409
+
+    first_resolution = client.patch(
+        f"/api/v1/ticket-escalations/{escalation_id}/resolve"
+    )
+    assert first_resolution.status_code == 200
+
+    second_resolution = client.patch(
+        f"/api/v1/ticket-escalations/{escalation_id}/resolve"
+    )
+    assert second_resolution.status_code == 409
+
+
+def test_agent_cannot_manage_another_members_escalation(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    ticket_response = create_ticket(client, context)
+
+    ticket_id = uuid.UUID(ticket_response.json()["id"])
+
+    with db_session_factory() as db:
+        agent_user, _ = create_member(
+            db,
+            uuid.UUID(context["organisation_id"]),
+            "AGENT",
+        )
+
+        escalation = TicketEscalation(
+            organisation_id=uuid.UUID(context["organisation_id"]),
+            ticket_id=ticket_id,
+            recipient_membership_id=uuid.UUID(context["caller_membership_id"]),
+            target_type="RESPONSE",
+            escalation_level="BREACHED",
+            reason="Admin assigned escalation",
+            status="PENDING",
+        )
+        db.add(escalation)
+        db.commit()
+        escalation_id = str(escalation.id)
+
+        agent_token = create_access_token(str(agent_user.id))
+
+    client.headers.update({"Authorization": f"Bearer {agent_token}"})
+
+    response = client.patch(f"/api/v1/ticket-escalations/{escalation_id}/acknowledge")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == (
+        "You can only manage escalations assigned to you."
+    )
+
+
+def test_requester_cannot_acknowledge_or_resolve_escalation(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    ticket_response = create_ticket(client, context)
+
+    ticket_id = uuid.UUID(ticket_response.json()["id"])
+
+    with db_session_factory() as db:
+        escalation = TicketEscalation(
+            organisation_id=uuid.UUID(context["organisation_id"]),
+            ticket_id=ticket_id,
+            recipient_membership_id=uuid.UUID(context["caller_membership_id"]),
+            target_type="RESPONSE",
+            escalation_level="BREACHED",
+            reason="Test escalation",
+            status="PENDING",
+        )
+        db.add(escalation)
+        db.commit()
+        escalation_id = str(escalation.id)
+
+    requester_token = create_access_token(context["requester_user_id"])
+    client.headers.update({"Authorization": f"Bearer {requester_token}"})
+
+    acknowledge_response = client.patch(
+        f"/api/v1/ticket-escalations/{escalation_id}/acknowledge"
+    )
+    assert acknowledge_response.status_code == 403
+
+    resolve_response = client.patch(
+        f"/api/v1/ticket-escalations/{escalation_id}/resolve"
+    )
+    assert resolve_response.status_code == 403
