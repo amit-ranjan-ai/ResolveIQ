@@ -3569,3 +3569,116 @@ def test_ai_classification_does_not_modify_existing_ticket(
         )
 
     assert current_values == original_values
+
+
+def test_ai_suggested_reply_uses_only_public_comments(
+    client,
+    db_session_factory,
+    monkeypatch,
+):
+
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    public_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "The application crashes when I log in.",
+            "is_internal": False,
+        },
+    )
+    assert public_response.status_code == 201
+
+    internal_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Internal note: investigating server logs.",
+            "is_internal": True,
+        },
+    )
+    assert internal_response.status_code == 201
+
+    def mock_generate_reply(ticket, public_comments):
+        assert ticket.id == uuid.UUID(ticket_id)
+        assert len(public_comments) == 1
+        assert public_comments[0].message == ("The application crashes when I log in.")
+        return {
+            "suggested_reply": "Could you please share the time of the crash?",
+            "model": "llama3.2",
+            "context_comment_count": 1,
+        }
+
+    monkeypatch.setattr(
+        "app.api.v1.ai.generate_ticket_reply",
+        mock_generate_reply,
+    )
+
+    response = client.post(f"/api/v1/tickets/{ticket_id}/ai/suggest-reply")
+
+    assert response.status_code == 200
+
+    result = response.json()
+
+    assert result["ticket_id"] == ticket_id
+    assert result["suggested_reply"] == (
+        "Could you please share the time of the crash?"
+    )
+    assert result["model"] == "llama3.2"
+    assert result["context_comment_count"] == 1
+    assert result["requires_human_review"] is True
+
+
+def test_requester_cannot_generate_ai_suggested_reply(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+        role="REQUESTER",
+    )
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    response = client.post(f"/api/v1/tickets/{ticket_id}/ai/suggest-reply")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == (
+        "Only support staff can generate suggested replies."
+    )
+
+
+def test_ai_suggested_reply_handles_ollama_failure(
+    client,
+    db_session_factory,
+    monkeypatch,
+):
+    from app.services.ai.reply_service import OllamaServiceError
+
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+
+    def mock_generate_reply(ticket, public_comments):
+        raise OllamaServiceError("Unable to communicate with the Ollama service.")
+
+    monkeypatch.setattr(
+        "app.api.v1.ai.generate_ticket_reply",
+        mock_generate_reply,
+    )
+
+    response = client.post(f"/api/v1/tickets/{ticket_id}/ai/suggest-reply")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Unable to communicate with the Ollama service."
+    )

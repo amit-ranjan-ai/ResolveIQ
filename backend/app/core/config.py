@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     UPLOAD_DIRECTORY: Path = Path("uploads")
     MAX_UPLOAD_SIZE: int = 10 * 1024 * 1024
     VALKEY_URL: str = "valkey://127.0.0.1:6379/0"
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "llama3.2"
+    OLLAMA_TIMEOUT_SECONDS: int = 60
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

@@ -43,3 +43,12 @@ class TicketClassificationResponse(BaseModel):
     overall_confidence: int = Field(ge=0, le=100)
     fields_requiring_review: list[str] = Field(default_factory=list)
     confidence_type: str = "heuristic"
+
+
+class TicketReplySuggestionResponse(BaseModel):
+    ticket_id: UUID
+    ticket_number: str
+    suggested_reply: str
+    model: str
+    context_comment_count: int = Field(ge=0)
+    requires_human_review: bool = True
