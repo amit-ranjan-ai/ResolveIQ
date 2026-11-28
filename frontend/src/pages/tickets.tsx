@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Ticket,
   CircleDot,
@@ -12,6 +12,9 @@ import {
   History,
   Activity,
   RefreshCw,
+  Sparkles,
+  Copy,
+  Loader2,
 } from "lucide-react";
 
 import {
@@ -31,6 +34,10 @@ import {
   getTicketActivities,
   type TicketActivity,
 } from "@/services/ticket-activities";
+import {
+  suggestTicketReply,
+  type TicketReplySuggestionResponse,
+} from "@/services/ai";
 
 function getPriorityLabel(priority: string) {
   const labels: Record<string, string> = {
@@ -111,7 +118,15 @@ export function Tickets() {
 
   const [tickets, setTickets] = useState<OrganisationTicket[]>([]);
   const [membershipId, setMembershipId] = useState("");
+  const [membershipRole, setMembershipRole] = useState("");
   const [activities, setActivities] = useState<TicketActivity[]>([]);
+
+  const [replySuggestion, setReplySuggestion] =
+    useState<TicketReplySuggestionResponse | null>(null);
+  const [replyDraft, setReplyDraft] = useState("");
+  const [isGeneratingReply, setIsGeneratingReply] = useState(false);
+  const [replyError, setReplyError] = useState("");
+  const [copySuccess, setCopySuccess] = useState(false);
 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
@@ -128,6 +143,63 @@ export function Tickets() {
   const [error, setError] = useState("");
   const [membershipError, setMembershipError] = useState("");
   const [actionError, setActionError] = useState("");
+
+  const selectedTicketIdRef = useRef<string | null>(null);
+
+  const canGenerateAIReply = ["OWNER", "ADMIN", "AGENT"].includes(
+    membershipRole,
+  );
+
+  async function handleGenerateAIReply() {
+    if (!selectedTicket || !canGenerateAIReply || isGeneratingReply) {
+      return;
+    }
+
+    const ticketId = selectedTicket.id;
+
+    setIsGeneratingReply(true);
+    setReplyError("");
+    setReplySuggestion(null);
+    setReplyDraft("");
+    setCopySuccess(false);
+
+    try {
+      const result = await suggestTicketReply(ticketId);
+
+      if (selectedTicketIdRef.current === ticketId) {
+        setReplySuggestion(result);
+        setReplyDraft(result.suggested_reply);
+      }
+    } catch (err) {
+      console.error("Failed to generate AI reply:", err);
+
+      if (selectedTicketIdRef.current === ticketId) {
+        setReplyError(
+          "Unable to generate an AI reply. Check that the backend and Ollama are running, then try again.",
+        );
+      }
+    } finally {
+      if (selectedTicketIdRef.current === ticketId) {
+        setIsGeneratingReply(false);
+      }
+    }
+  }
+
+  async function handleCopyAIReply() {
+    if (!replyDraft.trim()) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(replyDraft);
+      setCopySuccess(true);
+      setReplyError("");
+    } catch (err) {
+      console.error("Failed to copy AI reply:", err);
+      setCopySuccess(false);
+      setReplyError("Unable to copy the reply. Please copy it manually.");
+    }
+  }
 
   async function loadTickets(organisationId: string) {
     setIsLoading(true);
@@ -185,8 +257,11 @@ export function Tickets() {
   }, [selectedOrganisationId]);
 
   useEffect(() => {
+    setMembershipId("");
+    setMembershipRole("");
+
     if (!selectedOrganisationId) {
-      setMembershipId("");
+      setMembershipError("");
       return;
     }
 
@@ -202,12 +277,14 @@ export function Tickets() {
 
         if (active) {
           setMembershipId(membership.id);
+          setMembershipRole(membership.role);
         }
       } catch (err) {
         console.error("Failed to load organisation membership:", err);
 
         if (active) {
           setMembershipId("");
+          setMembershipRole("");
           setMembershipError(
             "Your active organisation membership could not be loaded.",
           );
@@ -223,14 +300,20 @@ export function Tickets() {
   }, [selectedOrganisationId]);
 
   useEffect(() => {
+    selectedTicketIdRef.current = selectedTicket?.id ?? null;
+
+    setReplySuggestion(null);
+    setReplyDraft("");
+    setReplyError("");
+    setCopySuccess(false);
+    setIsGeneratingReply(false);
+
     if (!selectedTicket) {
       setActivities([]);
       setIsLoadingActivities(false);
       return;
     }
 
-    // Capture the ID before the asynchronous function.
-    // This prevents TypeScript from treating selectedTicket as nullable.
     const ticketId = selectedTicket.id;
 
     let active = true;
@@ -280,7 +363,7 @@ export function Tickets() {
     try {
       const newTicket = await createOrganisationTicket(selectedOrganisationId, {
         requester_membership_id: membershipId,
-        category_id: null,
+        category_id: data.category_id,
         subject: data.subject,
         description: data.description,
         impact: data.impact,
@@ -406,7 +489,11 @@ export function Tickets() {
         <div className="flex gap-2">
           <button
             type="button"
-            onClick={() => void loadTickets(selectedOrganisationId)}
+            onClick={() => {
+              if (selectedOrganisationId) {
+                void loadTickets(selectedOrganisationId);
+              }
+            }}
             disabled={!selectedOrganisationId || isLoading}
             className="inline-flex items-center justify-center gap-2 rounded-lg border px-3 py-2.5 text-sm font-medium transition-colors hover:bg-accent disabled:opacity-50"
           >
@@ -635,6 +722,7 @@ export function Tickets() {
       <CreateTicketDialog
         open={dialogOpen}
         isCreating={isCreating}
+        organisationId={selectedOrganisationId ?? ""}
         onClose={() => setDialogOpen(false)}
         onCreate={handleCreateTicket}
       />
@@ -754,6 +842,78 @@ export function Tickets() {
 
               {actionError && (
                 <p className="text-sm text-red-600">{actionError}</p>
+              )}
+
+              {canGenerateAIReply && (
+                <section className="space-y-4 rounded-xl border p-4">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="size-5 text-primary" />
+                    <div>
+                      <h3 className="font-semibold">AI Suggested Reply</h3>
+                      <p className="text-xs text-muted-foreground">
+                        Generate a customer-facing reply using local Ollama AI.
+                      </p>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => void handleGenerateAIReply()}
+                    disabled={isGeneratingReply}
+                    className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {isGeneratingReply ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Sparkles className="size-4" />
+                    )}
+                    {isGeneratingReply
+                      ? "Generating Reply..."
+                      : "Generate AI Reply"}
+                  </button>
+
+                  {replyError && (
+                    <p className="text-sm text-red-600">{replyError}</p>
+                  )}
+
+                  {replySuggestion && (
+                    <div className="space-y-3">
+                      <textarea
+                        value={replyDraft}
+                        onChange={(event) => {
+                          setReplyDraft(event.target.value);
+                          setCopySuccess(false);
+                        }}
+                        rows={7}
+                        aria-label="Editable AI suggested reply"
+                        className="w-full resize-y rounded-lg border bg-background p-3 text-sm leading-6 outline-none focus:ring-2 focus:ring-primary/30"
+                      />
+
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <p className="text-xs text-muted-foreground">
+                          Model: {replySuggestion.model} · Context comments:{" "}
+                          {replySuggestion.context_comment_count}
+                        </p>
+
+                        <button
+                          type="button"
+                          onClick={() => void handleCopyAIReply()}
+                          disabled={!replyDraft.trim()}
+                          className="inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium hover:bg-accent disabled:opacity-50"
+                        >
+                          <Copy className="size-4" />
+                          {copySuccess ? "Copied!" : "Copy Reply"}
+                        </button>
+                      </div>
+
+                      <p className="text-xs text-amber-700 dark:text-amber-400">
+                        Human review required. Check and edit this draft before
+                        sending it to the requester. ResolveIQ will not send it
+                        automatically.
+                      </p>
+                    </div>
+                  )}
+                </section>
               )}
 
               <div className="space-y-4">
