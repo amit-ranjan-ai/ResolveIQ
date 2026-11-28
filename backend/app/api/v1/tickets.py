@@ -2,7 +2,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    status,
+)
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -14,6 +20,7 @@ from app.core.authorization import (
 from app.core.dependencies import get_current_user
 from app.db.dependencies import get_db
 from app.models.category import Category
+from app.models.notification import Notification
 from app.models.organisation import Organisation
 from app.models.organisation_membership import OrganisationMembership
 from app.models.sla_policy import SLAPolicy
@@ -22,13 +29,17 @@ from app.models.team_membership import TeamMembership
 from app.models.ticket import Ticket
 from app.models.ticket_sla import TicketSLA
 from app.models.user import User
+from app.schemas.notification import NotificationResponse
 from app.schemas.ticket import (
     TicketAssignmentUpdate,
     TicketCreate,
     TicketResponse,
     TicketUpdate,
 )
+from app.services.notification import create_notification
 from app.services.ticket_activity import record_ticket_activity
+from app.services.ticket_priority import calculate_ticket_priority
+from app.services.websocket_manager import manager
 
 router = APIRouter(
     tags=["Tickets"],
@@ -109,25 +120,6 @@ def validate_ticket_category(
         )
 
 
-def calculate_ticket_priority(
-    impact: str,
-    urgency: str,
-) -> str:
-    priority_matrix = {
-        ("HIGH", "HIGH"): "P1",
-        ("HIGH", "MEDIUM"): "P2",
-        ("HIGH", "LOW"): "P2",
-        ("MEDIUM", "HIGH"): "P2",
-        ("MEDIUM", "MEDIUM"): "P3",
-        ("MEDIUM", "LOW"): "P3",
-        ("LOW", "HIGH"): "P3",
-        ("LOW", "MEDIUM"): "P4",
-        ("LOW", "LOW"): "P4",
-    }
-
-    return priority_matrix[(impact, urgency)]
-
-
 def generate_ticket_number() -> str:
     return f"RIQ-{uuid4().hex[:8].upper()}"
 
@@ -204,6 +196,88 @@ def validate_ticket_assignment(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="The assigned agent must belong to the selected team.",
                 )
+
+
+def notify_ticket_assignee(
+    db: Session,
+    ticket: Ticket,
+    previous_assigned_agent_membership_id: UUID | None,
+) -> Notification | None:
+    """Create a notification when a ticket is newly assigned to an agent."""
+
+    new_agent_membership_id = ticket.assigned_agent_membership_id
+
+    if (
+        new_agent_membership_id is None
+        or new_agent_membership_id == previous_assigned_agent_membership_id
+    ):
+        return None
+
+    return create_notification(
+        db=db,
+        organisation_id=ticket.organisation_id,
+        recipient_membership_id=new_agent_membership_id,
+        notification_type="TICKET_ASSIGNED",
+        title="Ticket assigned to you",
+        message=(
+            f"Ticket {ticket.ticket_number}: {ticket.subject} has been assigned to you."
+        ),
+        ticket_id=ticket.id,
+    )
+
+
+def notify_ticket_status_changed(
+    db: Session,
+    ticket: Ticket,
+    old_status: str,
+    actor_membership_id: UUID,
+) -> Notification | None:
+    """Create a notification when an assigned ticket changes status."""
+
+    recipient_membership_id = ticket.assigned_agent_membership_id
+
+    if (
+        recipient_membership_id is None
+        or recipient_membership_id == actor_membership_id
+        or ticket.status == old_status
+    ):
+        return None
+
+    return create_notification(
+        db=db,
+        organisation_id=ticket.organisation_id,
+        recipient_membership_id=recipient_membership_id,
+        notification_type="TICKET_STATUS_CHANGED",
+        title="Ticket status changed",
+        message=(
+            f"Ticket {ticket.ticket_number}: {ticket.subject} "
+            f"status changed from {old_status} to {ticket.status}."
+        ),
+        ticket_id=ticket.id,
+    )
+
+
+def schedule_notification_delivery(
+    db: Session,
+    background_tasks: BackgroundTasks,
+    notification: Notification,
+) -> None:
+    """Schedule live notification delivery after the database commit."""
+
+    db.refresh(notification)
+
+    notification_payload = NotificationResponse.model_validate(
+        notification,
+    ).model_dump(mode="json")
+
+    background_tasks.add_task(
+        manager.send_to_member,
+        notification.recipient_membership_id,
+        {
+            "type": "NEW_NOTIFICATION",
+            "notification": notification_payload,
+        },
+    )
 
 
 @router.post(
@@ -457,6 +531,7 @@ def update_ticket(
     ticket_data: TicketUpdate,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
+    background_tasks: BackgroundTasks,
 ):
     ticket = db.get(Ticket, ticket_id)
 
@@ -504,6 +579,7 @@ def update_ticket(
 
     old_status = ticket.status
     old_priority = ticket.priority
+    old_assigned_agent_membership_id = ticket.assigned_agent_membership_id
 
     updates = ticket_data.model_dump(exclude_unset=True)
 
@@ -582,6 +658,7 @@ def update_ticket(
                 ticket_sla.resolved_at = ticket.resolved_at or datetime.now(UTC)
             else:
                 ticket_sla.resolved_at = None
+
     try:
         if ticket.status != old_status:
             record_ticket_activity(
@@ -590,7 +667,9 @@ def update_ticket(
                 ticket_id=ticket.id,
                 actor_membership_id=current_membership.id,
                 activity_type="STATUS_CHANGED",
-                description=f"Ticket status changed from {old_status} to {ticket.status}.",
+                description=(
+                    f"Ticket status changed from {old_status} to {ticket.status}."
+                ),
                 old_value=str(old_status),
                 new_value=str(ticket.status),
             )
@@ -602,10 +681,43 @@ def update_ticket(
                 ticket_id=ticket.id,
                 actor_membership_id=current_membership.id,
                 activity_type="PRIORITY_CHANGED",
-                description=f"Ticket priority changed from {old_priority} to {ticket.priority}.",
+                description=(
+                    f"Ticket priority changed from {old_priority} to {ticket.priority}."
+                ),
                 old_value=str(old_priority),
                 new_value=str(ticket.priority),
             )
+
+        assignment_notification = notify_ticket_assignee(
+            db=db,
+            ticket=ticket,
+            previous_assigned_agent_membership_id=old_assigned_agent_membership_id,
+        )
+
+        status_notification = notify_ticket_status_changed(
+            db=db,
+            ticket=ticket,
+            old_status=old_status,
+            actor_membership_id=current_membership.id,
+        )
+
+        db.commit()
+        db.refresh(ticket)
+
+        if assignment_notification is not None:
+            schedule_notification_delivery(
+                db=db,
+                background_tasks=background_tasks,
+                notification=assignment_notification,
+            )
+
+        if status_notification is not None:
+            schedule_notification_delivery(
+                db=db,
+                background_tasks=background_tasks,
+                notification=status_notification,
+            )
+
         db.commit()
         db.refresh(ticket)
 
@@ -636,6 +748,7 @@ def update_ticket_assignment(
     assignment_data: TicketAssignmentUpdate,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
+    background_tasks: BackgroundTasks,
 ):
     ticket = db.get(Ticket, ticket_id)
 
@@ -703,8 +816,22 @@ def update_ticket_assignment(
                 activity_type="ASSIGNMENT_CHANGED",
                 description="Ticket assignment was updated.",
             )
+
+        notification = notify_ticket_assignee(
+            db=db,
+            ticket=ticket,
+            previous_assigned_agent_membership_id=old_agent_id,
+        )
+
         db.commit()
         db.refresh(ticket)
+
+        if notification is not None:
+            schedule_notification_delivery(
+                db=db,
+                background_tasks=background_tasks,
+                notification=notification,
+            )
 
     except IntegrityError as error:
         db.rollback()

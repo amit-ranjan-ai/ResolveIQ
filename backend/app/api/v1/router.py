@@ -1,6 +1,10 @@
 from fastapi import APIRouter
 
+from app.api.v1.ai import router as ai_router
 from app.api.v1.auth import router as auth_router
+from app.api.v1.categories import router as categories_router
+from app.api.v1.notification_websocket import router as notification_websocket_router
+from app.api.v1.notifications import router as notifications_router
 from app.api.v1.organisations import router as organisations_router
 from app.api.v1.sla_dashboard import router as sla_dashboard_router
 from app.api.v1.sla_policies import router as sla_policies_router
@@ -29,6 +33,10 @@ api_router.include_router(ticket_sla_router)
 api_router.include_router(sla_dashboard_router)
 api_router.include_router(sla_policies_router)
 api_router.include_router(ticket_escalations_router)
+api_router.include_router(notifications_router)
+api_router.include_router(notification_websocket_router)
+api_router.include_router(categories_router)
+api_router.include_router(ai_router)
 
 
 @api_router.get("/status")

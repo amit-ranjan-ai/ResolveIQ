@@ -13,6 +13,7 @@ from app.core.jwt import create_access_token
 from app.db.base import Base
 from app.db.dependencies import get_db
 from app.main import app
+from app.models.notification import Notification
 from app.models.organisation import Organisation
 from app.models.organisation_membership import OrganisationMembership
 from app.models.sla_policy import SLAPolicy
@@ -2400,6 +2401,7 @@ def test_updating_sla_policy_does_not_change_existing_ticket_deadlines(
 def test_process_sla_escalations_and_prevent_duplicates(
     client,
     db_session_factory,
+    monkeypatch,
 ):
     context = create_ticket_context(db_session_factory)
     response = create_ticket(client, context)
@@ -2408,6 +2410,21 @@ def test_process_sla_escalations_and_prevent_duplicates(
 
     organisation_id = uuid.UUID(context["organisation_id"])
     ticket_id = uuid.UUID(response.json()["id"])
+    recipient_id = uuid.UUID(context["caller_membership_id"])
+    published_events = []
+
+    def capture_notification(recipient_membership_id, notification_payload):
+        published_events.append(
+            {
+                "recipient_membership_id": recipient_membership_id,
+                "notification": notification_payload,
+            }
+        )
+
+    monkeypatch.setattr(
+        "app.services.ticket_escalation.publish_notification_event",
+        capture_notification,
+    )
 
     with db_session_factory() as db:
         ticket_sla = db.scalar(
@@ -2433,6 +2450,21 @@ def test_process_sla_escalations_and_prevent_duplicates(
         )
 
     assert created_count == 2
+    assert len(published_events) == 2
+
+    assert all(
+        event["recipient_membership_id"] == recipient_id for event in published_events
+    )
+
+    assert all(
+        event["notification"]["notification_type"] == "SLA_BREACHED"
+        for event in published_events
+    )
+
+    assert all(
+        event["notification"]["ticket_id"] == str(ticket_id)
+        for event in published_events
+    )
 
     with db_session_factory() as db:
         escalations = db.scalars(
@@ -2451,6 +2483,28 @@ def test_process_sla_escalations_and_prevent_duplicates(
             escalation.escalation_level == "BREACHED" for escalation in escalations
         )
 
+        notifications = db.scalars(
+            select(Notification).where(
+                Notification.organisation_id == organisation_id,
+                Notification.ticket_id == ticket_id,
+            )
+        ).all()
+
+        assert len(notifications) == 2
+        assert all(
+            notification.notification_type == "SLA_BREACHED"
+            for notification in notifications
+        )
+        assert all(
+            notification.title == "SLA deadline breached"
+            for notification in notifications
+        )
+        assert all(
+            notification.recipient_membership_id == recipient_id
+            for notification in notifications
+        )
+        assert all(notification.is_read is False for notification in notifications)
+
     with db_session_factory() as db:
         duplicate_count = process_sla_escalations(
             db=db,
@@ -2458,9 +2512,24 @@ def test_process_sla_escalations_and_prevent_duplicates(
         )
 
     assert duplicate_count == 0
+    assert len(published_events) == 2
+
+    with db_session_factory() as db:
+        notifications = db.scalars(
+            select(Notification).where(
+                Notification.organisation_id == organisation_id,
+                Notification.ticket_id == ticket_id,
+            )
+        ).all()
+
+        assert len(notifications) == 2
 
 
-def test_create_at_risk_sla_escalation(client, db_session_factory):
+def test_create_at_risk_sla_escalation(
+    client,
+    db_session_factory,
+    monkeypatch,
+):
     context = create_ticket_context(db_session_factory)
     response = create_ticket(client, context)
 
@@ -2468,6 +2537,21 @@ def test_create_at_risk_sla_escalation(client, db_session_factory):
 
     organisation_id = uuid.UUID(context["organisation_id"])
     ticket_id = uuid.UUID(response.json()["id"])
+    recipient_id = uuid.UUID(context["caller_membership_id"])
+    published_events = []
+
+    def capture_notification(recipient_membership_id, notification_payload):
+        published_events.append(
+            {
+                "recipient_membership_id": recipient_membership_id,
+                "notification": notification_payload,
+            }
+        )
+
+    monkeypatch.setattr(
+        "app.services.ticket_escalation.publish_notification_event",
+        capture_notification,
+    )
 
     with db_session_factory() as db:
         ticket_sla = db.scalar(
@@ -2493,6 +2577,17 @@ def test_create_at_risk_sla_escalation(client, db_session_factory):
         )
 
         assert created_count == 1
+        assert len(published_events) == 1
+
+        published_event = published_events[0]
+
+        assert published_event["recipient_membership_id"] == recipient_id
+
+        assert published_event["notification"]["notification_type"] == "SLA_AT_RISK"
+
+        assert published_event["notification"]["ticket_id"] == str(ticket_id)
+
+        assert published_event["notification"]["title"] == "SLA deadline approaching"
 
         escalation = db.scalar(
             select(TicketEscalation).where(
@@ -2505,6 +2600,20 @@ def test_create_at_risk_sla_escalation(client, db_session_factory):
         assert escalation.target_type == "RESPONSE"
         assert escalation.escalation_level == "AT_RISK"
         assert escalation.status == "PENDING"
+
+        notification = db.scalar(
+            select(Notification).where(
+                Notification.organisation_id == organisation_id,
+                Notification.ticket_id == ticket_id,
+            )
+        )
+
+        assert notification is not None
+        assert notification.recipient_membership_id == recipient_id
+        assert notification.notification_type == "SLA_AT_RISK"
+        assert notification.title == "SLA deadline approaching"
+        assert notification.is_read is False
+        assert "Response SLA" in notification.message
 
 
 def test_get_escalation_recipient_prefers_team_lead(
@@ -2963,3 +3072,500 @@ def test_requester_cannot_acknowledge_or_resolve_escalation(
         f"/api/v1/ticket-escalations/{escalation_id}/resolve"
     )
     assert resolve_response.status_code == 403
+
+
+def test_ticket_assignment_creates_notification_for_assigned_agent(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+    organisation_id = uuid.UUID(context["organisation_id"])
+
+    with db_session_factory() as db:
+        agent_user, agent_membership = create_member(
+            db,
+            organisation_id,
+            "AGENT",
+        )
+
+        team = Team(
+            organisation_id=organisation_id,
+            name="Notification Test Team",
+        )
+        db.add(team)
+        db.flush()
+
+        db.add(
+            TeamMembership(
+                organisation_id=organisation_id,
+                team_id=team.id,
+                organisation_membership_id=agent_membership.id,
+            )
+        )
+        db.commit()
+
+        team_id = str(team.id)
+        agent_membership_id = str(agent_membership.id)
+        agent_token = create_access_token(str(agent_user.id))
+
+    assignment_response = client.patch(
+        f"/api/v1/tickets/{ticket_id}/assignment",
+        json={
+            "assigned_team_id": team_id,
+            "assigned_agent_membership_id": agent_membership_id,
+        },
+    )
+
+    assert assignment_response.status_code == 200
+
+    with db_session_factory() as db:
+        notification = db.scalar(
+            select(Notification).where(
+                Notification.organisation_id == organisation_id,
+                Notification.recipient_membership_id == uuid.UUID(agent_membership_id),
+                Notification.ticket_id == uuid.UUID(ticket_id),
+            )
+        )
+
+        assert notification is not None
+        assert notification.notification_type == "TICKET_ASSIGNED"
+        assert notification.title == "Ticket assigned to you"
+        assert created.json()["ticket_number"] in notification.message
+        assert notification.is_read is False
+
+    notification_response = client.get(
+        f"/api/v1/organisations/{context['organisation_id']}/notifications",
+        headers={"Authorization": f"Bearer {agent_token}"},
+    )
+
+    assert notification_response.status_code == 200
+
+    notifications = notification_response.json()
+
+    assert len(notifications) == 1
+    assert notifications[0]["notification_type"] == "TICKET_ASSIGNED"
+    assert notifications[0]["ticket_id"] == ticket_id
+
+
+def test_reassigning_same_agent_does_not_create_duplicate_notification(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = uuid.UUID(created.json()["id"])
+    organisation_id = uuid.UUID(context["organisation_id"])
+
+    with db_session_factory() as db:
+        _agent_user, agent_membership = create_member(
+            db,
+            organisation_id,
+            "AGENT",
+        )
+
+        team = Team(
+            organisation_id=organisation_id,
+            name="Duplicate Notification Test Team",
+        )
+        db.add(team)
+        db.flush()
+
+        db.add(
+            TeamMembership(
+                organisation_id=organisation_id,
+                team_id=team.id,
+                organisation_membership_id=agent_membership.id,
+            )
+        )
+        db.commit()
+
+        team_id = str(team.id)
+        agent_membership_id = str(agent_membership.id)
+
+    assignment_payload = {
+        "assigned_team_id": team_id,
+        "assigned_agent_membership_id": agent_membership_id,
+    }
+
+    first_response = client.patch(
+        f"/api/v1/tickets/{ticket_id}/assignment",
+        json=assignment_payload,
+    )
+
+    assert first_response.status_code == 200
+
+    second_response = client.patch(
+        f"/api/v1/tickets/{ticket_id}/assignment",
+        json=assignment_payload,
+    )
+
+    assert second_response.status_code == 200
+
+    with db_session_factory() as db:
+        notifications = db.scalars(
+            select(Notification).where(
+                Notification.organisation_id == organisation_id,
+                Notification.recipient_membership_id == uuid.UUID(agent_membership_id),
+                Notification.ticket_id == ticket_id,
+                Notification.notification_type == "TICKET_ASSIGNED",
+            )
+        ).all()
+
+        assert len(notifications) == 1
+
+
+def test_requester_public_comment_notifies_assigned_agent(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(
+        db_session_factory,
+        role="REQUESTER",
+    )
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = uuid.UUID(created.json()["id"])
+    organisation_id = uuid.UUID(context["organisation_id"])
+
+    with db_session_factory() as db:
+        agent_user, agent_membership = create_member(
+            db,
+            organisation_id,
+            "AGENT",
+        )
+
+        ticket = db.get(Ticket, ticket_id)
+        ticket.assigned_agent_membership_id = agent_membership.id
+        db.commit()
+
+        agent_token = create_access_token(str(agent_user.id))
+        agent_membership_id = agent_membership.id
+
+    comment_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "I still need assistance.",
+            "is_internal": False,
+        },
+    )
+
+    assert comment_response.status_code == 201
+
+    with db_session_factory() as db:
+        notification = db.scalar(
+            select(Notification).where(
+                Notification.organisation_id == organisation_id,
+                Notification.recipient_membership_id == agent_membership_id,
+                Notification.ticket_id == ticket_id,
+            )
+        )
+
+        assert notification is not None
+        assert notification.notification_type == "TICKET_COMMENT_ADDED"
+        assert notification.title == "New comment on assigned ticket"
+        assert notification.is_read is False
+
+    notification_response = client.get(
+        f"/api/v1/organisations/{context['organisation_id']}/notifications",
+        headers={"Authorization": f"Bearer {agent_token}"},
+    )
+
+    assert notification_response.status_code == 200
+    assert len(notification_response.json()) == 1
+    assert notification_response.json()[0]["ticket_id"] == str(ticket_id)
+
+
+def test_support_public_comment_notifies_requester(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = uuid.UUID(created.json()["id"])
+    organisation_id = uuid.UUID(context["organisation_id"])
+    requester_membership_id = uuid.UUID(context["requester_membership_id"])
+
+    comment_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "We have identified the issue.",
+            "is_internal": False,
+        },
+    )
+
+    assert comment_response.status_code == 201
+
+    with db_session_factory() as db:
+        notification = db.scalar(
+            select(Notification).where(
+                Notification.organisation_id == organisation_id,
+                Notification.recipient_membership_id == requester_membership_id,
+                Notification.ticket_id == ticket_id,
+            )
+        )
+
+        assert notification is not None
+        assert notification.notification_type == "TICKET_COMMENT_ADDED"
+        assert notification.title == "New reply on your ticket"
+        assert notification.is_read is False
+
+        requester_token = create_access_token(context["requester_user_id"])
+
+    notification_response = client.get(
+        f"/api/v1/organisations/{context['organisation_id']}/notifications",
+        headers={"Authorization": f"Bearer {requester_token}"},
+    )
+
+    assert notification_response.status_code == 200
+    assert len(notification_response.json()) == 1
+    assert notification_response.json()[0]["ticket_id"] == str(ticket_id)
+
+
+def test_internal_note_does_not_create_notification(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = uuid.UUID(created.json()["id"])
+    organisation_id = uuid.UUID(context["organisation_id"])
+
+    internal_response = client.post(
+        f"/api/v1/tickets/{ticket_id}/comments",
+        json={
+            "message": "Confidential internal investigation.",
+            "is_internal": True,
+        },
+    )
+
+    assert internal_response.status_code == 201
+
+    with db_session_factory() as db:
+        notifications = db.scalars(
+            select(Notification).where(
+                Notification.organisation_id == organisation_id,
+                Notification.ticket_id == ticket_id,
+            )
+        ).all()
+
+        assert notifications == []
+
+
+def test_ticket_assignment_sends_live_websocket_notification(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory, role="OWNER")
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = created.json()["id"]
+    organisation_id = uuid.UUID(context["organisation_id"])
+
+    with db_session_factory() as db:
+        agent_user, agent_membership = create_member(
+            db,
+            organisation_id,
+            "AGENT",
+        )
+
+        team = Team(
+            organisation_id=organisation_id,
+            name="Live Notification Test Team",
+        )
+        db.add(team)
+        db.flush()
+
+        db.add(
+            TeamMembership(
+                organisation_id=organisation_id,
+                team_id=team.id,
+                organisation_membership_id=agent_membership.id,
+            )
+        )
+        db.commit()
+
+        team_id = str(team.id)
+        agent_membership_id = str(agent_membership.id)
+        agent_token = create_access_token(str(agent_user.id))
+
+    websocket_url = (
+        f"/api/v1/organisations/{context['organisation_id']}/notifications/ws"
+    )
+
+    with client.websocket_connect(websocket_url) as websocket:
+        websocket.send_json({"token": agent_token})
+
+        connected_message = websocket.receive_json()
+
+        assert connected_message["type"] == "CONNECTED"
+
+        assignment_response = client.patch(
+            f"/api/v1/tickets/{ticket_id}/assignment",
+            headers={"Authorization": f"Bearer {context['access_token']}"},
+            json={
+                "assigned_team_id": team_id,
+                "assigned_agent_membership_id": agent_membership_id,
+            },
+        )
+
+        assert assignment_response.status_code == 200
+
+        notification_message = websocket.receive_json()
+
+        assert notification_message["type"] == "NEW_NOTIFICATION"
+
+        notification = notification_message["notification"]
+
+        assert notification["notification_type"] == "TICKET_ASSIGNED"
+        assert notification["recipient_membership_id"] == agent_membership_id
+        assert notification["ticket_id"] == ticket_id
+        assert notification["title"] == "Ticket assigned to you"
+
+    with db_session_factory() as db:
+        saved_notification = db.scalar(
+            select(Notification).where(
+                Notification.organisation_id == organisation_id,
+                Notification.recipient_membership_id == uuid.UUID(agent_membership_id),
+                Notification.ticket_id == uuid.UUID(ticket_id),
+                Notification.notification_type == "TICKET_ASSIGNED",
+            )
+        )
+
+        assert saved_notification is not None
+
+
+def test_ticket_status_change_creates_notification_for_assigned_agent(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+    created = create_ticket(client, context)
+
+    assert created.status_code == 201
+
+    ticket_id = uuid.UUID(created.json()["id"])
+    organisation_id = uuid.UUID(context["organisation_id"])
+
+    with db_session_factory() as db:
+        agent_user, agent_membership = create_member(
+            db,
+            organisation_id,
+            "AGENT",
+        )
+
+        ticket = db.get(Ticket, ticket_id)
+        ticket.assigned_agent_membership_id = agent_membership.id
+        db.commit()
+
+        agent_token = create_access_token(str(agent_user.id))
+        agent_membership_id = agent_membership.id
+
+    status_response = client.patch(
+        f"/api/v1/tickets/{ticket_id}",
+        headers={"Authorization": f"Bearer {context['access_token']}"},
+        json={"status": "In Progress"},
+    )
+
+    assert status_response.status_code == 200
+    assert status_response.json()["status"] == "In Progress"
+
+    with db_session_factory() as db:
+        notification = db.scalar(
+            select(Notification).where(
+                Notification.organisation_id == organisation_id,
+                Notification.recipient_membership_id == agent_membership_id,
+                Notification.ticket_id == ticket_id,
+            )
+        )
+
+        assert notification is not None
+        assert notification.notification_type == "TICKET_STATUS_CHANGED"
+        assert notification.title == "Ticket status changed"
+        assert notification.is_read is False
+
+    notification_response = client.get(
+        f"/api/v1/organisations/{context['organisation_id']}/notifications",
+        headers={"Authorization": f"Bearer {agent_token}"},
+    )
+
+    assert notification_response.status_code == 200
+
+    notifications = notification_response.json()
+
+    assert len(notifications) == 1
+    assert notifications[0]["notification_type"] == "TICKET_STATUS_CHANGED"
+    assert notifications[0]["ticket_id"] == str(ticket_id)
+
+
+def test_ai_classification_does_not_modify_existing_ticket(
+    client,
+    db_session_factory,
+):
+    context = create_ticket_context(db_session_factory)
+
+    # Create an existing ticket.
+    ticket_response = create_ticket(client, context)
+
+    assert ticket_response.status_code == 201
+
+    ticket_id = uuid.UUID(ticket_response.json()["id"])
+
+    # Record the ticket's original values.
+    with db_session_factory() as db:
+        ticket = db.get(Ticket, ticket_id)
+
+        original_values = (
+            ticket.subject,
+            ticket.description,
+            ticket.impact,
+            ticket.urgency,
+            ticket.priority,
+            ticket.status,
+        )
+
+    # Request AI classification.
+    ai_response = client.post(
+        f"/api/v1/organisations/{context['organisation_id']}/ai/classify-ticket",
+        json={
+            "subject": "Company-wide Wi-Fi outage",
+            "description": (
+                "All employees cannot connect to Wi-Fi. "
+                "The network is completely unavailable."
+            ),
+        },
+    )
+
+    assert ai_response.status_code == 200
+
+    # Verify that the existing ticket remains unchanged.
+    with db_session_factory() as db:
+        ticket = db.get(Ticket, ticket_id)
+
+        current_values = (
+            ticket.subject,
+            ticket.description,
+            ticket.impact,
+            ticket.urgency,
+            ticket.priority,
+            ticket.status,
+        )
+
+    assert current_values == original_values

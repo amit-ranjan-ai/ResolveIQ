@@ -1,4 +1,5 @@
 from app.models.category import Category
+from app.models.notification import Notification
 from app.models.organisation import Organisation
 from app.models.organisation_membership import OrganisationMembership
 from app.models.sla_policy import SLAPolicy
@@ -14,6 +15,7 @@ from app.models.user import User
 
 __all__ = [
     "Category",
+    "Notification",
     "Organisation",
     "OrganisationMembership",
     "SLAPolicy",
